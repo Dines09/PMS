@@ -1,0 +1,1397 @@
+/* =========================================================
+   PMS DASHBOARD — M.V. SEAWAYS MIRAGE
+   Mobile-first PWA. Dark-navy default. CSV auto-import.
+   PTW-06 permit flash. History-based back navigation.
+   ========================================================= */
+(function(){
+"use strict";
+
+/* ---------- Storage keys ---------- */
+const IMPORTED_JOBS_KEY = 'pms_dashboard_imported_jobs_v3';
+const META_KEY = 'pms_dashboard_import_meta_v3';
+const LS_KEY = 'pms_dashboard_state_v3';
+
+/* ---------- Load job data ---------- */
+let RAW = JSON.parse(document.getElementById('pms-data').textContent);
+let IMPORT_META = { vessel:null, company:null, reportDate:null };
+(function loadImported(){
+  try{
+    const stored = JSON.parse(localStorage.getItem(IMPORTED_JOBS_KEY));
+    if(Array.isArray(stored) && stored.length) RAW = stored;
+  }catch(e){}
+  try{
+    const m = JSON.parse(localStorage.getItem(META_KEY));
+    if(m && typeof m==='object') IMPORT_META = m;
+  }catch(e){}
+})();
+
+/* ---------- App state ---------- */
+function loadState(){
+  try{ const s = JSON.parse(localStorage.getItem(LS_KEY)); if(s && typeof s==='object') return s; }catch(e){}
+  return { statuses:{}, theme:null, signOffDate:null, jobMeta:{}, jobDueOverride:{}, permits:{} };
+}
+function saveState(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(STATE)); }catch(e){} }
+const STATE = loadState();
+STATE.statuses      = STATE.statuses      || {};
+STATE.jobMeta       = STATE.jobMeta       || {};
+STATE.jobDueOverride= STATE.jobDueOverride|| {};
+STATE.permits       = STATE.permits       || {};
+STATE.lastDone      = STATE.lastDone      || {};   // id -> most recent done date (for machine view)
+
+/* ============================================================
+   DATE HELPERS
+   ============================================================ */
+function todayISO(){ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+const TODAY = todayISO();
+function parseISO(s){ const [y,m,d]=s.split('-').map(Number); return new Date(y,m-1,d); }
+function fmtISO(dt){ return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0'); }
+function addDays(iso,n){ const d=parseISO(iso); d.setDate(d.getDate()+n); return fmtISO(d); }
+const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const MON = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function humanDate(iso){ const d=parseISO(iso); return DOW[d.getDay()]+', '+d.getDate()+' '+MON[d.getMonth()]+' '+d.getFullYear(); }
+function shortDate(iso){ if(!iso) return '—'; const d=parseISO(iso); return d.getDate()+' '+MON[d.getMonth()].slice(0,3)+' '+d.getFullYear(); }
+function shortDateNoYear(iso){ const d=parseISO(iso); return d.getDate()+' '+MON[d.getMonth()].slice(0,3); }
+function duePillParts(iso){ const d=parseISO(iso); return { day:d.getDate(), mon:MON[d.getMonth()].slice(0,3) }; }
+function daysBetween(a,b){ return Math.round((parseISO(b)-parseISO(a))/86400000); }
+function isSaturday(iso){ return parseISO(iso).getDay()===6; }
+function nextSaturdayFrom(iso){ let d=iso; for(let i=0;i<7;i++){ if(isSaturday(d)) return d; d=addDays(d,1);} return d; }
+
+function intervalToMonths(intervalStr){
+  if(!intervalStr) return null;
+  const m = String(intervalStr).trim().match(/^(\d+)\s*([A-Za-z]+)/);
+  if(!m) return null;
+  const n = Number(m[1]); const unit = m[2].toUpperCase();
+  if(unit.startsWith('M')) return n;
+  if(unit.startsWith('W')) return n/4.345;
+  if(unit.startsWith('Y')) return n*12;
+  if(unit.startsWith('D')) return n/30.44;
+  return null;
+}
+function addMonthsISO(iso, months){
+  const d = parseISO(iso); const day = d.getDate();
+  d.setDate(1); d.setMonth(d.getMonth()+Math.round(months));
+  const lastDay = new Date(d.getFullYear(), d.getMonth()+1, 0).getDate();
+  d.setDate(Math.min(day,lastDay));
+  return fmtISO(d);
+}
+/* interval parsing */
+function parseInterval(intervalStr){
+  const m = String(intervalStr||'').trim().toUpperCase().match(/^(\d+)\s*([A-Za-z]+)/);
+  if(!m) return { n:null, unit:null };
+  return { n:Number(m[1]), unit:m[2][0] }; // unit: M / W / Y / D
+}
+function isWeekly(job){
+  const {n,unit} = parseInterval(job.interval);
+  if(unit==='W') return true;
+  if(unit==='D' && n<=7) return true;
+  return false;
+}
+/* Feature: descriptive interval label */
+function intervalLabel(intervalStr){
+  const {n,unit} = parseInterval(intervalStr);
+  if(n==null) return intervalStr||'';
+  if(unit==='W'){ return n===1?'Weekly':n+' Weekly'; }
+  if(unit==='D'){ if(n===1) return 'Daily'; if(n===7) return 'Weekly'; return n+' Daily'; }
+  if(unit==='Y'){ return n===1?'Yearly':n+' Yearly'; }
+  if(unit==='M'){
+    if(n===1) return 'Monthly';
+    if(n===12) return 'Yearly';
+    return n+' Monthly';
+  }
+  return intervalStr;
+}
+/* interval in whole months (weeks/days -> fractional) for ranking */
+function intervalMonths(intervalStr){
+  const {n,unit} = parseInterval(intervalStr);
+  if(n==null) return 0;
+  if(unit==='Y') return n*12;
+  if(unit==='M') return n;
+  if(unit==='W') return n/4.345;
+  if(unit==='D') return n/30.44;
+  return n;
+}
+/* Colour: 3-monthly = blue; 6-monthly AND anything longer = red; 1-monthly & shorter (weekly/daily) as specified.
+   User rule: >6-monthly also red. 3M blue. 1M grey. Weekly frequent -> red. */
+function intervalColorClass(intervalStr){
+  const {n,unit} = parseInterval(intervalStr);
+  if(n==null) return 'interval-grey';
+  const months = intervalMonths(intervalStr);
+  if(unit==='M' && n===3) return 'interval-blue';   // 3-monthly = blue
+  if(months >= 6) return 'interval-red';            // 6-monthly and longer = red
+  if(unit==='W' || (unit==='D' && n<=7)) return 'interval-red'; // weekly frequent = red
+  return 'interval-grey';                           // 1-monthly & other shorter = grey
+}
+/* Universal job sort: critical first, then interval DESCENDING (bigger interval on top). */
+function jobSortKey(a,b){
+  if((b.critical?1:0)!==(a.critical?1:0)) return (b.critical?1:0)-(a.critical?1:0);
+  const ma=intervalMonths(a.interval), mb=intervalMonths(b.interval);
+  if(mb!==ma) return mb-ma;                          // bigger interval first
+  return getJobDue(a).localeCompare(getJobDue(b));   // tie-break by due date
+}
+function sortJobs(list){ return list.slice().sort(jobSortKey); }
+
+/* ============================================================
+   CSV PARSER
+   ============================================================ */
+function toTitleCase(s){ return String(s||'').toLowerCase().replace(/\b\w/g, c=>c.toUpperCase()); }
+function normDate(raw){
+  if(!raw) return '';
+  raw = String(raw).trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const m = raw.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+  if(m){ const mi=MON.findIndex(x=>x.slice(0,3).toLowerCase()===m[2].toLowerCase()); if(mi>=0) return m[3]+'-'+String(mi+1).padStart(2,'0')+'-'+String(Number(m[1])).padStart(2,'0'); }
+  return raw;
+}
+function splitCsvLine(line){
+  line = line.replace(/^\s*\d+\t/, '');
+  const out=[]; let cur=''; let inQ=false;
+  for(let i=0;i<line.length;i++){ const ch=line[i];
+    if(inQ){ if(ch==='"'){ if(line[i+1]==='"'){cur+='"';i++;} else inQ=false; } else cur+=ch; }
+    else { if(ch==='"') inQ=true; else if(ch===','){ out.push(cur); cur=''; } else cur+=ch; } }
+  out.push(cur); return out.map(s=>s.trim());
+}
+function parseCsvToJobs(text){
+  const rawLines = text.split(/\r?\n/).filter(l=>l.trim().length);
+  const jobs=[]; let autoId=1; let vessel=null,company=null,reportDate=null;
+  rawLines.forEach(line=>{
+    const f = splitCsvLine(line);
+    if(f.length<24) return;
+    if((f[5]||'').toLowerCase()!=='sl.') return;
+    if(!company){ company=f[0]; vessel=f[2]; reportDate=normDate(f[4]); }
+    const groupFull=f[14]||''; if(!groupFull) return;
+    const item=f[17]||''; if(!item) return;
+    const work=f[18]||''; const done=normDate(f[21]||''); const due=normDate(f[22]||'');
+    const interval=(f[23]||'').replace(/"/g,'').trim(); const dept=f[24]||''; const critFlag=f[16]||'';
+    let system=groupFull,machine=groupFull; const dash=groupFull.indexOf(' - ');
+    if(dash>=0){ system=groupFull.slice(0,dash).trim(); machine=groupFull.slice(dash+3).trim(); }
+    jobs.push({ id:autoId++, system:toTitleCase(system), machine:toTitleCase(machine),
+      group_full:toTitleCase(system)+' - '+toTitleCase(machine), item:toTitleCase(item),
+      work, done, due, interval, dept,
+      critical:/^(y|yes|c|crit|critical|\*)$/i.test(String(critFlag).trim()) });
+  });
+  return { jobs, vessel, company, reportDate };
+}
+function importAnyFormat(text){
+  const trimmed = text.trim();
+  if(trimmed.startsWith('[') || trimmed.startsWith('{')){
+    const parsed = JSON.parse(trimmed);
+    const arr = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.jobs)? parsed.jobs : null);
+    if(!arr) throw new Error('bad json');
+    return { jobs: arr, vessel:null, company:null, reportDate:null };
+  }
+  return parseCsvToJobs(text);
+}
+
+/* ============================================================
+   JOB STATUS  (per-occurrence: keyed by id@dueDate)
+   A status attaches to the specific occurrence (id + its due date at the
+   time of marking). When a job is completed its next-due is recalculated;
+   that new occurrence has a different key, so it shows as pending again.
+   ============================================================ */
+function getJobDue(job){ return STATE.jobDueOverride[job.id] || job.due; }
+function statusKey(job){ return job.id + '@' + getJobDue(job); }
+function getStatus(job){
+  // accept a job object; (legacy id fallback not used)
+  return STATE.statuses[statusKey(job)] || null;
+}
+function setStatusForKey(key, status){ if(status===null) delete STATE.statuses[key]; else STATE.statuses[key]=status; saveState(); }
+function setStatus(job, status){ setStatusForKey(statusKey(job), status); }
+function isOverdue(job){ return getJobDue(job) < TODAY && getStatus(job)!=='done'; }
+function withinSignOff(job){ if(!STATE.signOffDate) return true; return getJobDue(job) <= STATE.signOffDate; }
+function visibleJobs(){ return RAW.filter(withinSignOff); }
+
+/* Occurrences a job appears on:
+   - the live occurrence (override||due), pending unless acted on
+   - if the cycle advanced (override set) AND the original due was acted on,
+     the original due keeps its completed/postponed occurrence too. */
+function occurrencesOf(job){
+  const live = getJobDue(job);
+  const arr = [{ date: live, status: STATE.statuses[job.id+'@'+live]||null }];
+  const override = STATE.jobDueOverride[job.id];
+  if(override && override!==job.due){
+    const origStatus = STATE.statuses[job.id+'@'+job.due];
+    if(origStatus) arr.push({ date: job.due, status: origStatus });
+  }
+  return arr;
+}
+/* all visible occurrences due on a specific date (each carries its own status) */
+function occurrencesOnDate(dateISO){
+  const out=[];
+  visibleJobs().forEach(job=>{
+    occurrencesOf(job).forEach(o=>{ if(o.date===dateISO) out.push({job, date:o.date, status:o.status}); });
+  });
+  return out;
+}
+
+/* ============================================================
+   PTW-06 PERMITS
+   ============================================================ */
+function isFocusJob(j){
+  const hay = (j.machine+' '+j.item+' '+j.group_full).toLowerCase();
+  return hay.includes('motor starter') || hay.includes('breaker routine') ||
+         hay.includes('motor overhaul') || hay.includes('starter routine');
+}
+function createPermitForJob(job, doneISO){
+  const pid='P'+job.id;
+  // permit becomes due on the routine's done date (per spec)
+  STATE.permits[pid]={ id:pid, jobId:job.id, item:job.item, machine:job.machine, system:job.system, doneDate:doneISO, due:doneISO, status:'open', createdAt:TODAY };
+  saveState();
+}
+function activePermits(){ return Object.values(STATE.permits).filter(p=>p.status==='open').sort((a,b)=> a.due.localeCompare(b.due)); }
+function permitDone(pid){ if(STATE.permits[pid]){ delete STATE.permits[pid]; saveState(); } }
+function permitPostpone(pid){ if(STATE.permits[pid]){ STATE.permits[pid].status='postponed'; saveState(); } }
+function reflashPostponedPermits(){ let ch=false; Object.values(STATE.permits).forEach(p=>{ if(p.status==='postponed'){ p.status='open'; ch=true; } }); if(ch) saveState(); }
+function updatePermitBell(){
+  const bell=document.getElementById('permitBell'); const count=document.getElementById('permitBellCount');
+  const n=activePermits().length;
+  if(n>0){ count.textContent=n; count.style.display='flex'; bell.classList.add('flash'); }
+  else { count.style.display='none'; bell.classList.remove('flash'); }
+  document.querySelectorAll('[data-focus-badge]').forEach(el=>{ if(n>0){ el.textContent=n; el.style.display='flex'; } else el.style.display='none'; });
+  const tb=document.getElementById('chipToggleBadge'); if(tb){ if(n>0){ tb.textContent=n; tb.style.display='flex'; } else tb.style.display='none'; }
+}
+
+/* ============================================================
+   TABS + NAV
+   ============================================================ */
+const TABS = [
+  {id:'home',     label:'Home',    icon:'🏠'},
+  {id:'daily',    label:'Daily',   icon:'📅'},
+  {id:'weekly',   label:'Weekly',  icon:'🔁'},
+  {id:'month',    label:'Monthly', icon:'🗓️'},
+  {id:'critical', label:'Critical',icon:'⚠️'},
+  {id:'done',     label:'Done',    icon:'✅'},
+  {id:'postponed',label:'Postponed',icon:'⏸️'},
+  {id:'focus',    label:'Motor Starters', icon:'⚙️'},
+  {id:'machines', label:'Machines',icon:'🔧'},
+  {id:'search',   label:'Search',  icon:'🔍'},
+  {id:'settings', label:'Settings',icon:'⚙'},
+];
+const BOTTOM_TABS = ['home','daily','month','settings'];
+/* chip order requested: search, machines, critical, done, postponed, motor starters, weekly */
+const CHIP_TABS   = ['search','machines','critical','done','postponed','focus','weekly'];
+
+/* ---------- Navigation state (drill-downs) ---------- */
+const nav = {
+  tab:'home',
+  date:TODAY,
+  system:null, machine:null,
+  focusMonth:null, monthBucket:null,
+  critMonth:'all',
+  searchQuery:'',
+  focusPermitsOpen:false,
+  __dayModal:null
+};
+
+/* ---------- History stack for hardware back button ---------- */
+/* Each entry = a snapshot of nav (deep-ish copy). back() pops to previous. */
+let HISTORY = [];
+
+function snapshot(){ return JSON.parse(JSON.stringify(nav)); }
+function applySnapshot(s){ Object.assign(nav, s); }
+
+/* Go to a new logical location (records history) */
+function go(mutator, opts){
+  const prev = snapshot();
+  mutator();
+  // avoid pushing a duplicate
+  if(JSON.stringify(prev)!==JSON.stringify(nav)){
+    HISTORY.push(prev);
+    if(!(opts && opts.noBrowser)) history.pushState({depth:HISTORY.length}, '');
+  }
+  render();
+}
+function switchTab(tabId){
+  go(()=>{
+    nav.tab = tabId;
+    // reset drill-down context when jumping to a top tab
+    if(tabId==='machines'){ nav.system=null; nav.machine=null; }
+    if(tabId==='month'){ nav.monthBucket=null; }
+  });
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+function render(){
+  // toggle views
+  document.querySelectorAll('.view').forEach(v=> v.classList.remove('active'));
+  const view = document.getElementById('view-'+nav.tab);
+  if(view) view.classList.add('active');
+  // active states on nav
+  document.querySelectorAll('.tab-btn').forEach(b=> b.classList.toggle('active', b.dataset.tab===nav.tab));
+  document.querySelectorAll('.chip').forEach(b=> b.classList.toggle('active', b.dataset.tab===nav.tab));
+  document.querySelectorAll('.nav-item').forEach(b=> b.classList.toggle('active', b.dataset.tab===nav.tab));
+  moveNavSlider();
+  renderCurrentView();
+  if(nav.__dayModal){ showDayModalNow(nav.__dayModal); }
+  updatePermitBell();
+}
+
+function moveNavSlider(){
+  const bar = document.getElementById('bottomBar');
+  const slider = bar.querySelector('.nav-slider');
+  if(!slider) return;
+  const active = bar.querySelector('.nav-item.active');
+  if(active){
+    slider.style.width = active.offsetWidth+'px';
+    slider.style.transform = 'translateX('+ (active.offsetLeft - 7) +'px)';
+    slider.style.opacity = '1';
+  } else {
+    slider.style.opacity = '0';
+  }
+}
+
+function renderNav(){
+  const dt = document.getElementById('tabNavDesktop');
+  dt.innerHTML = TABS.map(t=>{
+    const badge = t.id==='focus' ? '<span class="tb-badge" data-focus-badge style="display:none;">0</span>' : '';
+    return '<button class="tab-btn '+(t.id===nav.tab?'active':'')+'" data-tab="'+t.id+'"><span>'+t.icon+'</span><span>'+t.label+'</span>'+badge+'</button>';
+  }).join('');
+  dt.querySelectorAll('.tab-btn').forEach(b=> b.addEventListener('click', ()=>switchTab(b.dataset.tab)));
+
+  const bb = document.getElementById('bottomBar');
+  bb.innerHTML = '<div class="nav-slider"></div>' + BOTTOM_TABS.map(id=>{
+    const t=TABS.find(x=>x.id===id);
+    return '<button class="nav-item '+(id===nav.tab?'active':'')+'" data-tab="'+id+'"><span class="ni-icon">'+t.icon+'</span><span>'+t.label+'</span></button>';
+  }).join('');
+  bb.querySelectorAll('.nav-item').forEach(b=> b.addEventListener('click', ()=>switchTab(b.dataset.tab)));
+
+  const cr = document.getElementById('chipRow');
+  cr.innerHTML = CHIP_TABS.map(id=>{
+    const t=TABS.find(x=>x.id===id);
+    const badge = id==='focus' ? '<span class="chip-badge" data-focus-badge style="display:none;">0</span>' : '';
+    return '<button class="chip '+(id===nav.tab?'active':'')+'" data-tab="'+id+'"><span class="c-icon">'+t.icon+'</span><span>'+t.label+'</span>'+badge+'</button>';
+  }).join('');
+  cr.querySelectorAll('.chip').forEach(b=> b.addEventListener('click', ()=>{ switchTab(b.dataset.tab); collapseChips(); }));
+  updatePermitBell();
+  requestAnimationFrame(moveNavSlider);
+}
+
+/* ---------- Collapsible chip zone ---------- */
+function collapseChips(){ const z=document.getElementById('chipZone'); if(z) z.classList.add('collapsed'); }
+function expandChips(){ const z=document.getElementById('chipZone'); if(z) z.classList.remove('collapsed'); }
+function toggleChips(){ const z=document.getElementById('chipZone'); if(z) z.classList.toggle('collapsed'); }
+
+function renderCurrentView(){
+  switch(nav.tab){
+    case 'home': renderHome(); break;
+    case 'daily': renderDaily(); break;
+    case 'weekly': renderWeekly(); break;
+    case 'month': renderMonth(); break;
+    case 'critical': renderCritical(); break;
+    case 'done': renderStatusList('done'); break;
+    case 'postponed': renderStatusList('postponed'); break;
+    case 'focus': renderFocus(); break;
+    case 'machines': renderMachines(); break;
+    case 'search': renderSearch(); break;
+    case 'settings': renderSettings(); break;
+  }
+}
+
+function computeStats(jobs){
+  return {
+    total: jobs.length,
+    critical: jobs.filter(j=>j.critical).length,
+    done: statusOccurrences('done').length,
+    postponed: statusOccurrences('postponed').length,
+    overdue: jobs.filter(isOverdue).length,
+    motor: jobs.filter(isFocusJob).length,
+  };
+}
+
+/* ============================================================
+   JOB CARD (with flip)
+   ============================================================ */
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function displayWork(job){
+  if(isFocusJob(job) && String(job.work).trim().toLowerCase()==='clean') return 'Motor Starter Routine';
+  return job.work;
+}
+function jobCardFront(job, opts){
+  opts = opts||{};
+  // occurrence-aware: an explicit occDate/occStatus overrides the live one
+  const due = opts.occDate || getJobDue(job);
+  const status = (opts.occDate!=null) ? (opts.occStatus||null) : getStatus(job);
+  const overdue = due < TODAY && status!=='done';
+  const cls=['job-card'];
+  if(job.critical) cls.push('is-critical');
+  if(status==='done') cls.push('is-done');
+  if(status==='postponed') cls.push('is-postponed');
+  const dp = duePillParts(due);
+  const pillCls = status==='done' ? 'done' : (overdue?'overdue':'');
+  const icls = intervalColorClass(job.interval);
+  // top-right corner status/maintenance tag
+  let corner='';
+  if(opts.lastMaint) corner = '<div class="corner-tag last">Last Maintenance</div>';
+  else if(opts.noStatusCorner) corner = (status==='postponed' ? '<div class="corner-tag postp">Postponed</div>' : '');
+  else if(status==='done') corner = '<div class="corner-tag done">Completed</div>';
+  else if(status==='postponed') corner = '<div class="corner-tag postp">Postponed</div>';
+  // Weekly view: no date pill (they repeat) → show a "WK" chip instead
+  const pill = opts.noDate
+    ? '<div class="due-pill" style="background:var(--accent-soft);color:var(--accent);"><span class="dp-day" style="font-size:14px;">WK</span></div>'
+    : '<div class="due-pill '+pillCls+'"><span class="dp-day">'+dp.day+'</span><span class="dp-mon">'+dp.mon+'</span></div>';
+  const occDate = due;   // the date this card represents
+  return ''+
+    '<div class="'+cls.join(' ')+'" data-job-id="'+job.id+'" data-occ-date="'+occDate+'">'+
+      corner+
+      pill+
+      '<div class="job-info">'+
+        '<div class="job-title">'+esc(job.item)+'</div>'+
+        '<div class="job-work">Work — <span>'+esc(displayWork(job))+'</span></div>'+
+        '<div class="job-sub">'+esc(job.system)+' · '+esc(job.machine)+'</div>'+
+        '<div class="job-tags">'+
+          '<span class="tag '+icls+'">'+esc(intervalLabel(job.interval))+'</span>'+
+          (job.critical?'<span class="tag crit">Critical</span>':'')+
+          (isWeekly(job)?'<span class="tag weekly">Weekly</span>':'')+
+          (overdue?'<span class="tag overdue">Overdue</span>':'')+
+          (isFocusJob(job)?'<span class="tag permit">PTW-06</span>':'')+
+        '</div>'+
+      '</div>'+
+      '<div class="job-actions">'+
+        (status
+          ? '<button class="act-btn undo" data-action="undo" title="Undo">↺</button>'
+          : '<button class="act-btn complete" data-action="done" title="Complete">✓</button><button class="act-btn postpone" data-action="postponed" title="Postpone">⏸</button>')+
+      '</div>'+
+    '</div>';
+}
+function jobCardBack(job){
+  const lastDone = (STATE.lastDone && STATE.lastDone[job.id]) || job.done;
+  return ''+
+    '<div class="job-back">'+
+      '<div class="jb-label">Last Maintenance</div>'+
+      '<div class="jb-date">'+(lastDone?shortDate(lastDone):'No record')+'</div>'+
+      (job.dept?'<div class="jb-dept">Dept · '+esc(job.dept)+'</div>':'')+
+    '</div>';
+}
+function jobCard(job, opts){
+  opts = opts||{};
+  const occDate = opts.occDate || getJobDue(job);
+  return ''+
+  '<div class="job-flip" data-flip-id="'+job.id+'" data-occ-date="'+occDate+'">'+
+    '<div class="job-swipe-wrap" data-job-id="'+job.id+'">'+
+      '<div class="swipe-bg right">✓ Complete</div>'+
+      '<div class="swipe-bg left">⏸ Postpone</div>'+
+      '<div class="flip-inner">'+
+        '<div class="flip-face flip-front">'+jobCardFront(job, opts)+'</div>'+
+        '<div class="flip-face flip-back">'+jobCardBack(job)+'</div>'+
+      '</div>'+
+    '</div>'+
+  '</div>';
+}
+
+function completeJob(id, opts){
+  const job = RAW.find(j=>j.id===id);
+  if(!job) return;
+  const doneDate = (opts && opts.doneDate) || TODAY;
+  const location = (opts && opts.location) || 'At Sea';
+  // 1) mark the CURRENT occurrence done (uses current due for the key)
+  const doneKey = statusKey(job);
+  setStatusForKey(doneKey, 'done');
+  // meta keyed by the same occurrence key, plus a per-id "last done" for machine view
+  STATE.jobMeta[doneKey] = { location, doneDate };
+  STATE.lastDone = STATE.lastDone || {};
+  STATE.lastDone[id] = doneDate;
+  // 2) advance the cycle → next due becomes a fresh (pending) occurrence
+  const months = intervalToMonths(job.interval);
+  if(months) STATE.jobDueOverride[id] = addMonthsISO(doneDate, months);
+  if(isFocusJob(job)) createPermitForJob(job, doneDate);
+  saveState();
+}
+function postponeJob(id, occDate){
+  const job = RAW.find(j=>j.id===id); if(!job) return;
+  const key = job.id+'@'+(occDate||getJobDue(job));
+  setStatusForKey(key,'postponed'); toast('Postponed'); refreshAll();
+}
+
+function attachJobActions(container){
+  container.querySelectorAll('.job-flip').forEach(flip=>{
+    const id = Number(flip.dataset.flipId);
+    const occDate = flip.dataset.occDate;
+    // buttons (desktop)
+    flip.querySelectorAll('.act-btn').forEach(btn=>{
+      btn.addEventListener('click', e=>{
+        e.stopPropagation();
+        const action = btn.dataset.action;
+        if(action==='undo'){ clearJob(id, occDate); return; }
+        if(action==='postponed'){ postponeJob(id, occDate); return; }
+        if(action==='done'){ openCompletePopup(id); }
+      });
+    });
+  });
+  attachSwipeAndFlip(container);
+}
+function clearJob(id, occDate){
+  const job = RAW.find(j=>j.id===id); if(!job) return;
+  const key = job.id+'@'+(occDate||getJobDue(job));
+  const wasDone = STATE.statuses[key]==='done';
+  setStatusForKey(key, null);
+  delete STATE.jobMeta[key];
+  // if we undid a completion, roll the cycle back
+  if(wasDone){ delete STATE.jobDueOverride[id]; if(STATE.lastDone) delete STATE.lastDone[id]; const pid='P'+id; if(STATE.permits[pid]) delete STATE.permits[pid]; }
+  saveState(); toast('Status cleared'); refreshAll();
+}
+function refreshAll(){ updatePermitBell(); renderCurrentView(); }
+
+/* ---- flip management: only one card flipped at a time, auto re-flip ---- */
+let currentFlipped = null;
+let flipTimer = null;
+function unflipCurrent(){
+  if(currentFlipped){ currentFlipped.classList.remove('flipped'); currentFlipped=null; }
+  if(flipTimer){ clearTimeout(flipTimer); flipTimer=null; }
+}
+function flipCard(flip){
+  if(currentFlipped && currentFlipped!==flip){ currentFlipped.classList.remove('flipped'); }
+  if(flipTimer){ clearTimeout(flipTimer); flipTimer=null; }
+  flip.classList.add('flipped');
+  currentFlipped = flip;
+  flipTimer = setTimeout(()=>{ if(currentFlipped===flip){ flip.classList.remove('flipped'); currentFlipped=null; } }, 5000);
+}
+
+/* Swipe (mobile) + single-tap flip */
+function attachSwipeAndFlip(container){
+  container.querySelectorAll('.job-flip').forEach(flip=>{
+    const wrap = flip.querySelector('.job-swipe-wrap');
+    const inner = flip.querySelector('.flip-inner');
+    const card = flip.querySelector('.flip-front .job-card');
+    const id = Number(wrap.dataset.jobId);
+    const occDate = flip.dataset.occDate;
+    const bgRight = wrap.querySelector('.swipe-bg.right');
+    const bgLeft  = wrap.querySelector('.swipe-bg.left');
+    let startX=0,startY=0,dx=0,dragging=false,decided=false,isH=false,moved=false;
+    const T=80;
+
+    function resetPos(){ inner.style.transition='transform .2s ease'; inner.style.transform=''; bgRight.style.opacity=0; bgLeft.style.opacity=0; }
+
+    card.addEventListener('touchstart', e=>{
+      if(e.target.closest('.act-btn')) return;
+      if(flip.classList.contains('flipped')) return;
+      const t=e.touches[0]; startX=t.clientX; startY=t.clientY; dx=0;
+      dragging=true; decided=false; isH=false; moved=false; inner.style.transition='none';
+    }, {passive:true});
+    card.addEventListener('touchmove', e=>{
+      if(!dragging) return;
+      const t=e.touches[0]; const diffX=t.clientX-startX, diffY=t.clientY-startY;
+      if(!decided){ if(Math.abs(diffX)>8||Math.abs(diffY)>8){ decided=true; isH=Math.abs(diffX)>Math.abs(diffY); moved=true; } }
+      if(!isH) return;
+      e.preventDefault(); dx=diffX; inner.style.transform='translateX('+dx+'px)';
+      if(dx>0){ bgRight.style.opacity=Math.min(1,dx/T); bgLeft.style.opacity=0; }
+      else { bgLeft.style.opacity=Math.min(1,-dx/T); bgRight.style.opacity=0; }
+    }, {passive:false});
+    card.addEventListener('touchend', ()=>{
+      if(!dragging) return; dragging=false;
+      if(isH && Math.abs(dx)>=T){
+        if(dx>0){
+          // swipe right → open the complete popup (location + scroll date)
+          resetPos();
+          openCompletePopup(id);
+        } else {
+          inner.style.transition='transform .2s ease'; inner.style.transform='translateX(-'+window.innerWidth+'px)';
+          setTimeout(()=>{ postponeJob(id, occDate); }, 170);
+        }
+        return;
+      }
+      resetPos();
+    });
+    card.addEventListener('touchcancel', resetPos);
+
+    // single tap (front) => flip; tap (back) => flip back
+    card.addEventListener('click', e=>{
+      if(e.target.closest('.act-btn')) return;
+      if(moved) { moved=false; return; }
+      if(flip.classList.contains('flipped')) unflipCurrent();
+      else flipCard(flip);
+    });
+    flip.querySelector('.flip-back').addEventListener('click', unflipCurrent);
+  });
+}
+
+/* ============================================================
+   COMPLETE POPUP — bottom sheet with location + scrollable date wheels
+   ============================================================ */
+function closePopover(){ document.getElementById('popoverRoot').innerHTML=''; }
+
+/* Build a scrollable wheel column. items = [{v,label}]. Returns selected value via data attr. */
+function wheelColumn(name, items, selectedVal){
+  const opts = items.map(it=> '<div class="wheel-item" data-val="'+it.v+'">'+it.label+'</div>').join('');
+  return '<div class="wheel" data-wheel="'+name+'" data-val="'+selectedVal+'"><div class="wheel-track">'+opts+'</div></div>';
+}
+function openCompletePopup(jobId){
+  closePopover();
+  const job = RAW.find(j=>j.id===jobId); if(!job) return;
+  const focus = isFocusJob(job);
+  const root = document.getElementById('popoverRoot');
+  const now = parseISO(TODAY);
+  const curY = now.getFullYear();
+  const years = []; for(let y=curY-2;y<=curY+3;y++) years.push({v:y,label:String(y)});
+  const months = MON.map((m,i)=>({v:i+1,label:m.slice(0,3)}));
+  const days = []; for(let d=1;d<=31;d++) days.push({v:d,label:String(d)});
+  const selD = now.getDate(), selM = now.getMonth()+1, selY = curY;
+
+  root.innerHTML =
+    '<div class="sheet-overlay" id="cpOverlay"></div>'+
+    '<div class="complete-sheet" id="cpSheet">'+
+      '<div class="cs-grip"></div>'+
+      '<div class="cs-title">Complete — '+esc(job.item)+'</div>'+
+      '<div class="cs-sub">Where was it done?</div>'+
+      '<div class="cs-loc" id="cpLoc">'+
+        '<button class="cs-loc-btn active" data-loc="At Sea">At Sea</button>'+
+        '<button class="cs-loc-btn" data-loc="At Port">At Port</button>'+
+        '<button class="cs-loc-btn" data-loc="At Anchor">At Anchor</button>'+
+      '</div>'+
+      '<div class="cs-sub">Done date <span style="color:var(--text-faint);font-weight:600;">(scroll ↕)</span></div>'+
+      '<div class="wheel-row">'+
+        wheelColumn('day', days, selD)+
+        wheelColumn('mon', months, selM)+
+        wheelColumn('year', years, selY)+
+        '<div class="wheel-highlight"></div>'+
+      '</div>'+
+      (focus?'<div class="cs-permit">📋 A PTW-06 permit will be raised (due on this done date).</div>':'')+
+      '<div class="cs-actions"><button class="btn" id="cpCancel">Cancel</button><button class="btn primary" id="cpOk">OK</button></div>'+
+    '</div>';
+
+  document.getElementById('cpOverlay').addEventListener('click', closePopover);
+  document.getElementById('cpCancel').addEventListener('click', closePopover);
+  // location buttons
+  root.querySelectorAll('.cs-loc-btn').forEach(b=> b.addEventListener('click', ()=>{
+    root.querySelectorAll('.cs-loc-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active');
+  }));
+  // wheels
+  root.querySelectorAll('.wheel').forEach(setupWheel);
+
+  document.getElementById('cpOk').addEventListener('click', ()=>{
+    const loc = root.querySelector('.cs-loc-btn.active').dataset.loc;
+    const d = +root.querySelector('[data-wheel="day"]').dataset.val;
+    const m = +root.querySelector('[data-wheel="mon"]').dataset.val;
+    const y = +root.querySelector('[data-wheel="year"]').dataset.val;
+    const lastDay = new Date(y, m, 0).getDate();
+    const doneDate = y+'-'+String(m).padStart(2,'0')+'-'+String(Math.min(d,lastDay)).padStart(2,'0');
+    completeJob(jobId, {location:loc, doneDate});
+    closePopover(); toast('Marked complete'); refreshAll();
+  });
+}
+/* wheel: snap-scroll; the centered item is the selected value */
+const WHEEL_ITEM_H = 38;
+function setupWheel(wheel){
+  const track = wheel.querySelector('.wheel-track');
+  const items = Array.from(wheel.querySelectorAll('.wheel-item'));
+  const selVal = wheel.dataset.val;
+  const idx = Math.max(0, items.findIndex(it=> it.dataset.val===String(selVal)));
+  function setIndex(i, smooth){
+    i = Math.max(0, Math.min(items.length-1, i));
+    track.style.transition = smooth?'transform .18s ease':'none';
+    track.style.transform = 'translateY('+(-i*WHEEL_ITEM_H)+'px)';
+    wheel.dataset.val = items[i].dataset.val;
+    items.forEach((it,j)=> it.classList.toggle('sel', j===i));
+  }
+  setIndex(idx, false);
+  let curIdx = idx;
+  // wheel scroll (desktop)
+  wheel.addEventListener('wheel', e=>{ e.preventDefault(); curIdx += (e.deltaY>0?1:-1); curIdx=Math.max(0,Math.min(items.length-1,curIdx)); setIndex(curIdx,true); }, {passive:false});
+  // touch drag (mobile)
+  let startY=0, startIdx=0, dragging=false;
+  wheel.addEventListener('touchstart', e=>{ dragging=true; startY=e.touches[0].clientY; startIdx=curIdx; track.style.transition='none'; }, {passive:true});
+  wheel.addEventListener('touchmove', e=>{ if(!dragging) return; const dy=e.touches[0].clientY-startY; const off=startIdx*WHEEL_ITEM_H - dy; track.style.transform='translateY('+(-off)+'px)'; }, {passive:true});
+  wheel.addEventListener('touchend', e=>{ if(!dragging) return; dragging=false; const dy=(e.changedTouches[0].clientY-startY); curIdx = startIdx - Math.round(dy/WHEEL_ITEM_H); setIndex(curIdx,true); });
+  // click an item to select
+  items.forEach((it,j)=> it.addEventListener('click', ()=>{ curIdx=j; setIndex(j,true); }));
+}
+
+/* ============================================================
+   PERMIT MODAL
+   ============================================================ */
+function openPermitModal(){
+  const permits = activePermits();
+  const root = document.getElementById('modalRoot');
+  root.innerHTML =
+    '<div class="modal-overlay" id="permitOverlay"><div class="modal-sheet" onclick="event.stopPropagation()">'+
+      '<div class="modal-head"><h3>📋 PTW-06 Permits '+(permits.length?'— '+permits.length:'')+'</h3><button class="icon-btn" id="permitClose">✕</button></div>'+
+      (permits.length?
+        '<div style="font-size:11.5px;color:var(--text-faint);margin-bottom:10px;">Oldest first · tap a permit to sign it off</div>'+
+        permits.map(permitRow).join('')+
+        '<button class="btn primary" id="permitExport" style="margin-top:10px;">⬇ Export to Excel (.xls)</button>'
+        :
+        '<div class="empty-state"><div class="big-icon">✓</div><div class="msg">No open permits</div><div class="sub">Complete a Motor Starter / Routine job to raise a PTW-06 permit here.</div></div>')+
+    '</div></div>';
+  document.getElementById('permitOverlay').addEventListener('click', ()=>{ root.innerHTML=''; });
+  document.getElementById('permitClose').addEventListener('click', ()=>{ root.innerHTML=''; });
+  const ex=document.getElementById('permitExport'); if(ex) ex.addEventListener('click', (e)=>{ e.stopPropagation(); exportPermitsXls(); });
+  attachPermitActions(root);
+}
+/* Read-only permit row: only Item, Done date, Due date. Tap row to sign it off. */
+function permitRow(p){
+  const overdue = p.due < TODAY;
+  const doneStr = p.doneDate ? shortDate(p.doneDate) : '—';
+  return ''+
+    '<div class="permit-item '+(overdue?'overdue':'')+'" data-pid="'+p.id+'" title="Tap to sign off">'+
+      '<div class="permit-info">'+
+        '<div class="pi-title">'+esc(p.item)+'</div>'+
+        '<div class="pi-dates"><span class="pi-dl">Done</span> '+doneStr+' &nbsp;·&nbsp; <span class="pi-dl">Due</span> '+shortDate(p.due)+(overdue?' · OVERDUE':'')+'</div>'+
+      '</div>'+
+      '<div class="pi-tap">✓</div>'+
+    '</div>';
+}
+function attachPermitActions(scope){
+  scope.querySelectorAll('.permit-item').forEach(row=>{
+    const pid=row.dataset.pid;
+    row.addEventListener('click', ()=>{
+      permitDone(pid); toast('Permit signed off');
+      updatePermitBell();
+      if(document.getElementById('permitOverlay')) openPermitModal();
+      if(nav.tab==='focus') renderFocus();
+      if(nav.tab==='home') renderHome();
+    });
+  });
+}
+/* Export the permit list to an .xls (HTML-table based; opens in Excel/WPS). */
+function exportPermitsXls(){
+  const permits = activePermits();
+  if(!permits.length){ toast('No permits to export'); return; }
+  let rows = permits.map(p=>'<tr><td>'+esc(p.item)+'</td><td>'+(p.doneDate?shortDate(p.doneDate):'')+'</td><td>'+shortDate(p.due)+'</td></tr>').join('');
+  const html = '<html xmlns:x="urn:schemas-microsoft-com:office:excel"><head><meta charset="UTF-8"></head><body>'+
+    '<table border="1"><thead><tr><th>PMS Item</th><th>Done Date</th><th>Due Date</th></tr></thead><tbody>'+rows+'</tbody></table></body></html>';
+  downloadBlob(new Blob([html],{type:'application/vnd.ms-excel'}), 'PTW06_permits_'+TODAY+'.xls');
+  toast('Permits exported to Excel');
+}
+
+/* ============================================================
+   VIEW: HOME
+   ============================================================ */
+function renderHome(){
+  const jobsAll = visibleJobs();
+  const s = computeStats(jobsAll);
+  const pending = s.total - s.done;
+  const overallPct = s.total? Math.round(s.done/s.total*100):0;
+  const todayOccs = occurrencesOnDate(TODAY);
+  const todayDone = todayOccs.filter(o=>o.status==='done').length;
+  const todayPct = todayOccs.length? Math.round(todayDone/todayOccs.length*100):0;
+  const curMonth = TODAY.slice(0,7);
+  const monthJobs = jobsAll.filter(j=>getJobDue(j).slice(0,7)===curMonth);
+  const monthDone = statusOccurrences('done').filter(o=>o.doneDate.slice(0,7)===curMonth).length;
+  const monthTotal = monthJobs.length + monthDone;
+  const monthPct = monthTotal? Math.round(monthDone/monthTotal*100):0;
+  const next7=[];
+  for(let i=0;i<7;i++){ const d=addDays(TODAY,i); const occ=occurrencesOnDate(d); next7.push({d, cnt:occ.length, crit:occ.filter(o=>o.job.critical).length}); }
+  const upcomingCrit = jobsAll.filter(j=> j.critical && getStatus(j)!=='done' && getJobDue(j)>=TODAY && getJobDue(j).slice(0,7)===curMonth).sort((a,b)=>getJobDue(a).localeCompare(getJobDue(b)));
+  const ringR=46, circ=2*Math.PI*ringR, ringOffset=circ-(overallPct/100)*circ;
+  const permits = activePermits();
+
+  document.getElementById('view-home').innerHTML =
+    '<div class="progress-hero" style="margin:0 0 14px;"><div class="ph-top"><span>Today\'s Progress</span><b>'+todayPct+'%</b></div><div class="bar"><div class="fill" style="width:'+todayPct+'%"></div></div></div>'+
+    '<div class="stat-strip">'+
+      '<div class="stat-card" data-counter="total"><div class="num">'+s.total+'</div><div class="label">Total</div></div>'+
+      '<div class="stat-card crit" data-counter="critical"><div class="num">'+s.critical+'</div><div class="label">Critical</div></div>'+
+      '<div class="stat-card done" data-counter="done"><div class="num">'+s.done+'</div><div class="label">Done</div></div>'+
+      '<div class="stat-card postponed" data-counter="postponed"><div class="num">'+s.postponed+'</div><div class="label">Postponed</div></div>'+
+      '<div class="stat-card motor" data-counter="motor"><div class="num">'+s.motor+'</div><div class="label">Motor Starters</div></div>'+
+    '</div>'+
+    (permits.length?
+      '<div class="home-panel" style="margin-top:14px; border-color:var(--permit);"><h3 style="color:var(--permit);">📋 PTW-06 Permits Pending — '+permits.length+'</h3>'+permits.slice(0,4).map(permitRow).join('')+(permits.length>4?'<button class="btn" id="homeMorePermits" style="margin-top:6px;">View all '+permits.length+' permits</button>':'')+'</div>':'')+
+    '<div class="home-grid" style="margin-top:14px;">'+
+      '<div class="home-panel">'+
+        '<h3>Overall Completion</h3>'+
+        '<div class="ring-wrap"><svg class="ring" width="110" height="110" viewBox="0 0 110 110"><circle class="ring-track" cx="55" cy="55" r="'+ringR+'"></circle><circle class="ring-fill" cx="55" cy="55" r="'+ringR+'" stroke-dasharray="'+circ+'" stroke-dashoffset="'+ringOffset+'"></circle></svg>'+
+          '<div><div class="big-metric"><span class="v">'+overallPct+'%</span></div><div style="font-size:12.5px;color:var(--text-dim);margin-top:4px;">'+pending+' pending · '+s.overdue+' overdue · '+s.postponed+' postponed</div></div></div>'+
+        '<h3 style="margin-top:22px;">Next 7 Days</h3><div class="mini-list">'+
+          next7.map(x=>'<div class="mini-list-item" data-goto-daily="'+x.d+'"><span>'+(x.d===TODAY?'Today — ':'')+humanDate(x.d)+'</span><span class="n">'+x.cnt+' job'+(x.cnt===1?'':'s')+(x.crit?' · <span style="color:var(--crit)">'+x.crit+' crit</span>':'')+'</span></div>').join('')+
+        '</div>'+
+      '</div>'+
+      '<div class="home-panel">'+
+        '<h3>Today</h3><div class="big-metric"><span class="v">'+todayPct+'%</span><span class="l">'+todayDone+'/'+todayOccs.length+' done</span></div><div class="progress-bar-track" style="margin-top:8px;"><div class="progress-bar-fill" style="width:'+todayPct+'%"></div></div>'+
+        '<h3 style="margin-top:22px;">This Month</h3><div class="big-metric"><span class="v">'+monthPct+'%</span><span class="l">'+monthDone+'/'+monthJobs.length+' done</span></div><div class="progress-bar-track" style="margin-top:8px;"><div class="progress-bar-fill" style="width:'+monthPct+'%"></div></div>'+
+        '<h3 style="margin-top:22px;">Upcoming Criticals (this month)</h3>'+
+        (upcomingCrit.length? upcomingCrit.slice(0,8).map(j=>'<div class="upcoming-crit-item" data-goto-daily-crit="'+getJobDue(j)+'"><span>'+esc(j.item)+' <span style="color:var(--text-faint);">· '+esc(j.machine)+'</span></span><span class="uc-date">'+shortDateNoYear(getJobDue(j))+'</span></div>').join('') : '<div style="font-size:12.5px;color:var(--text-faint);padding:8px;">No upcoming criticals this month.</div>')+
+      '</div>'+
+    '</div>';
+
+  document.querySelectorAll('#view-home .stat-card').forEach(card=> card.addEventListener('click', ()=>{
+    const k=card.dataset.counter;
+    if(k==='motor'){ switchTab('focus'); return; }
+    if(k==='critical'){ switchTab('critical'); return; }
+    if(k==='done'){ switchTab('done'); return; }
+    if(k==='postponed'){ switchTab('postponed'); return; }
+    openCounterList(k);
+  }));
+  document.querySelectorAll('[data-goto-daily]').forEach(el=> el.addEventListener('click', ()=> go(()=>{ nav.date=el.dataset.gotoDaily; nav.tab='daily'; })));
+  document.querySelectorAll('[data-goto-daily-crit]').forEach(el=> el.addEventListener('click', ()=> go(()=>{ nav.date=el.dataset.gotoDailyCrit; nav.tab='daily'; })));
+  const mp=document.getElementById('homeMorePermits'); if(mp) mp.addEventListener('click', openPermitModal);
+  attachPermitActions(document.getElementById('view-home'));
+}
+
+function openCounterList(kind){
+  let jobs = visibleJobs(); let title='Total Jobs';
+  if(kind==='overdue'){ jobs=jobs.filter(isOverdue); title='Overdue Jobs'; }
+  jobs = jobs.slice().sort((a,b)=> getJobDue(a).localeCompare(getJobDue(b)));
+  const root=document.getElementById('modalRoot');
+  root.innerHTML =
+    '<div class="modal-overlay" id="counterOverlay"><div class="modal-sheet" onclick="event.stopPropagation()">'+
+      '<div class="modal-head"><h3>'+esc(title)+' — '+jobs.length+'</h3><button class="icon-btn" id="counterClose">✕</button></div>'+
+      '<div class="job-list" id="counterJobList">'+(jobs.length? jobs.map(jobCard).join('') : '<div class="empty-state"><div class="big-icon">✓</div><div class="msg">Nothing here</div></div>')+'</div>'+
+    '</div></div>';
+  document.getElementById('counterOverlay').addEventListener('click', ()=>{ root.innerHTML=''; });
+  document.getElementById('counterClose').addEventListener('click', ()=>{ root.innerHTML=''; });
+  attachJobActions(document.getElementById('counterJobList'));
+}
+
+/* ============================================================
+   VIEW: DAILY  (+ Saturday safety day)
+   ============================================================ */
+const NO_JOBS_QUOTES = [
+  "No jobs due on this date. Enjoy your day and make your ship proud.",
+  "No jobs due on this date. Take it easy — smooth seas ahead.",
+  "No jobs due on this date. Enjoy your day and make your ship shine.",
+];
+function safetyBannerHtml(){
+  if(isSaturday(nav.date)){
+    if(nav.date===TODAY) return '<div class="safety-banner"><span class="sb-ic">🦺</span><span>Today is Safety Day</span></div>';
+    return '<div class="safety-banner"><span class="sb-ic">🦺</span><span>Safety Day</span></div>';
+  }
+  // upcoming saturday hint
+  const nextSat = nextSaturdayFrom(nav.date);
+  const inDays = daysBetween(nav.date, nextSat);
+  if(inDays>0 && inDays<=7) return '<div class="safety-banner"><span class="sb-ic">🦺</span><span>Safety Day in '+inDays+' day'+(inDays===1?'':'s')+'</span></div>';
+  return '';
+}
+function renderDaily(){
+  let occs = occurrencesOnDate(nav.date);
+  occs.sort((a,b)=> jobSortKey(a.job,b.job));
+  const done = occs.filter(o=>o.status==='done').length;
+  const pct = occs.length? Math.round(done/occs.length*100):0;
+  const isToday = nav.date===TODAY;
+  const quote = NO_JOBS_QUOTES[Math.abs(nav.date.split('').reduce((a,c)=>a+c.charCodeAt(0),0))%NO_JOBS_QUOTES.length];
+  document.getElementById('view-daily').innerHTML =
+    '<div class="day-nav">'+
+      '<button class="arrow-btn" id="dayPrev">‹</button>'+
+      '<div class="day-label"><span class="dl-date">'+shortDate(nav.date)+'</span><span class="sub">'+(isToday?'Today':(parseISO(nav.date)<parseISO(TODAY)? Math.abs(daysBetween(nav.date,TODAY))+' days ago':'in '+daysBetween(TODAY,nav.date)+' days'))+'</span></div>'+
+      '<button class="arrow-btn" id="dayNext">›</button>'+
+      (!isToday?'<button class="today-btn" id="dayToday">Today</button>':'')+
+    '</div>'+
+    safetyBannerHtml()+
+    '<div class="progress-bar-wrap"><div class="progress-bar-track"><div class="progress-bar-fill" style="width:'+pct+'%"></div></div><div class="progress-pct">'+pct+'%</div></div>'+
+    '<div class="job-list" id="dailyJobList">'+(occs.length? occs.map(o=>jobCard(o.job,{occDate:o.date, occStatus:o.status})).join('') : '<div class="empty-state"><div class="big-icon">⚓</div><div class="msg">'+quote+'</div></div>')+'</div>';
+  document.getElementById('dayPrev').addEventListener('click', ()=>navDay(-1));
+  document.getElementById('dayNext').addEventListener('click', ()=>navDay(1));
+  const tb=document.getElementById('dayToday'); if(tb) tb.addEventListener('click', ()=> go(()=>{ nav.date=TODAY; }));
+  attachJobActions(document.getElementById('dailyJobList'));
+}
+function navDay(delta){ go(()=>{ nav.date=addDays(nav.date,delta); }); }
+
+/* ============================================================
+   VIEW: WEEKLY (unique weekly jobs)
+   ============================================================ */
+function renderWeekly(){
+  const jobs = sortJobs(visibleJobs().filter(isWeekly));
+  const overdue = jobs.filter(isOverdue).length;
+  const done = jobs.filter(j=>getStatus(j)==='done').length;
+  document.getElementById('view-weekly').innerHTML =
+    '<div class="section-title">🔁 Weekly Jobs — '+jobs.length+'</div>'+
+    '<div class="stat-strip" style="grid-template-columns:repeat(3,1fr);">'+
+      '<div class="stat-card done"><div class="num">'+done+'</div><div class="label">Done</div></div>'+
+      '<div class="stat-card overdue"><div class="num">'+overdue+'</div><div class="label">Overdue</div></div>'+
+      '<div class="stat-card"><div class="num">'+(jobs.length-done)+'</div><div class="label">Pending</div></div>'+
+    '</div>'+
+    '<div class="job-list" id="weeklyJobList" style="margin-top:14px;">'+(jobs.length? jobs.map(j=>jobCard(j,{noDate:true})).join('') : '<div class="empty-state"><div class="big-icon">🔁</div><div class="msg">No weekly jobs</div></div>')+'</div>';
+  attachJobActions(document.getElementById('weeklyJobList'));
+}
+
+/* ============================================================
+   VIEW: STATUS LIST (Done desc, Postponed)
+   ============================================================ */
+/* Build occurrence records from STATE.statuses. Each = {job, occDue, doneDate}. */
+function statusOccurrences(kind){
+  const out=[];
+  const byId = new Map(RAW.map(j=>[j.id,j]));
+  Object.keys(STATE.statuses).forEach(key=>{
+    if(STATE.statuses[key]!==kind) return;
+    const at = key.lastIndexOf('@'); if(at<0) return;
+    const id = Number(key.slice(0,at)); const occDue = key.slice(at+1);
+    const job = byId.get(id); if(!job) return;
+    if(STATE.signOffDate && occDue > STATE.signOffDate) return;
+    const meta = STATE.jobMeta[key];
+    out.push({ job, occDue, doneDate: (meta&&meta.doneDate)||occDue, key });
+  });
+  return out;
+}
+/* render a job card for a fixed occurrence (Done/Postponed lists) */
+function occurrenceCard(occ, kind){
+  const job = occ.job;
+  const dateShown = kind==='done' ? occ.doneDate : occ.occDue;   // done → the date it was actually done
+  const dp = duePillParts(dateShown);
+  const cls = ['job-card', kind==='done'?'is-done':'is-postponed'];
+  const pillCls = kind==='done'?'done':'overdue';
+  const icls = intervalColorClass(job.interval);
+  const corner = kind==='done' ? '<div class="corner-tag done">Completed</div>' : '<div class="corner-tag postp">Postponed</div>';
+  const front =
+    '<div class="'+cls.join(' ')+'" data-occ-key="'+occ.key+'" data-job-id="'+job.id+'">'+
+      corner+
+      '<div class="due-pill '+pillCls+'"><span class="dp-day">'+dp.day+'</span><span class="dp-mon">'+dp.mon+'</span></div>'+
+      '<div class="job-info">'+
+        '<div class="job-title">'+esc(job.item)+'</div>'+
+        '<div class="job-work">Work — <span>'+esc(displayWork(job))+'</span></div>'+
+        '<div class="job-sub">'+esc(job.system)+' · '+esc(job.machine)+'</div>'+
+        '<div class="job-tags">'+
+          '<span class="tag '+icls+'">'+esc(intervalLabel(job.interval))+'</span>'+
+          (job.critical?'<span class="tag crit">Critical</span>':'')+
+          (kind==='done'?'<span class="tag interval-grey">Done '+shortDateNoYear(occ.doneDate)+'</span>':'')+
+        '</div>'+
+      '</div>'+
+      '<div class="job-actions"><button class="act-btn undo" data-occ-undo="'+occ.key+'" data-job-id="'+job.id+'" title="Undo">↺</button></div>'+
+    '</div>';
+  return '<div class="job-flip"><div class="job-swipe-wrap">'+front+'</div></div>';
+}
+function renderStatusList(kind){
+  let occ = statusOccurrences(kind);
+  if(kind==='done') occ.sort((a,b)=> b.doneDate.localeCompare(a.doneDate));   // latest done first
+  else occ.sort((a,b)=> a.occDue.localeCompare(b.occDue));
+  const view=document.getElementById('view-'+kind);
+  const title = kind==='done'? '✅ Completed Jobs' : '⏸️ Postponed Jobs';
+  const icon = kind==='done'? '✓' : '⏸';
+  const emptyMsg = kind==='done'? 'Nothing completed yet' : 'Nothing postponed';
+  view.innerHTML =
+    '<div class="section-title">'+title+' — '+occ.length+'</div>'+
+    '<div class="job-list" id="'+kind+'JobList">'+(occ.length? occ.map(o=>occurrenceCard(o,kind)).join('') : '<div class="empty-state"><div class="big-icon">'+icon+'</div><div class="msg">'+emptyMsg+'</div></div>')+'</div>';
+  // undo handlers (clear that specific occurrence)
+  view.querySelectorAll('[data-occ-undo]').forEach(btn=> btn.addEventListener('click', e=>{
+    e.stopPropagation();
+    const key=btn.dataset.occUndo; const id=Number(btn.dataset.jobId);
+    setStatusForKey(key, null); delete STATE.jobMeta[key];
+    // if this was the done occurrence that advanced the cycle, roll back the override
+    const job=RAW.find(j=>j.id===id);
+    if(job && kind==='done'){ delete STATE.jobDueOverride[id]; if(STATE.lastDone) delete STATE.lastDone[id]; }
+    saveState(); toast('Status cleared'); updatePermitBell(); renderCurrentView();
+  }));
+}
+
+/* ============================================================
+   VIEW: MONTHLY
+   ============================================================ */
+function monthBuckets(){ return Array.from(new Set(visibleJobs().map(j=>getJobDue(j).slice(0,7)))).sort(); }
+function allDataMonths(){ return Array.from(new Set(RAW.map(j=>getJobDue(j).slice(0,7)))).sort(); }
+function renderMonth(){
+  if(nav.monthBucket){ renderMonthDetail(nav.monthBucket); return; }
+  const months=monthBuckets(); const hidden = STATE.signOffDate && allDataMonths().length>months.length;
+  document.getElementById('view-month').innerHTML =
+    '<div class="section-title">🗓️ Monthly Overview</div><div class="month-tile-grid">'+
+      months.map(m=>{ const jobs=visibleJobs().filter(j=>getJobDue(j).slice(0,7)===m); const crit=jobs.filter(j=>j.critical).length; const [y,mo]=m.split('-').map(Number);
+        return '<div class="month-tile" data-month="'+m+'" tabindex="0">'+(crit?'<div class="mt-crit">'+crit+'</div>':'')+'<div class="mt-mon">'+MON[mo-1].slice(0,3)+'</div><div class="mt-year">'+y+'</div><div class="mt-jobs">'+jobs.length+'<small>jobs</small></div></div>';
+      }).join('')+
+    '</div>'+(hidden?'<div class="signoff-msg">Change your sign-off month in Settings to see more.</div>':'');
+  document.querySelectorAll('.month-tile').forEach(el=>{ const g=()=> go(()=>{ nav.monthBucket=el.dataset.month; }); el.addEventListener('click', g); el.addEventListener('keydown', e=>{ if(e.key==='Enter') g(); }); });
+}
+function renderMonthDetail(m){
+  const jobs = sortJobs(visibleJobs().filter(j=>getJobDue(j).slice(0,7)===m));
+  const [y,mo]=m.split('-').map(Number); const label=MON[mo-1]+' '+y;
+  const daysInMonth=new Date(y,mo,0).getDate(); const firstDow=new Date(y,mo-1,1).getDay();
+  const jobsByDay={}; jobs.forEach(j=>{ const day=Number(getJobDue(j).slice(8,10)); (jobsByDay[day]=jobsByDay[day]||[]).push(j); });
+  let cells=''; for(let i=0;i<firstDow;i++) cells+='<div class="cal-cell empty"></div>';
+  for(let d=1;d<=daysInMonth;d++){
+    const dj=jobsByDay[d]||[]; const crit=dj.filter(j=>j.critical).length;
+    const iso=y+'-'+String(mo).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+    const cls=['cal-cell']; if(dj.length)cls.push('has-jobs'); if(crit)cls.push('has-crit'); if(iso===TODAY)cls.push('is-today'); if(isSaturday(iso))cls.push('is-saturday');
+    cells+='<div class="'+cls.join(' ')+'" data-date="'+iso+'" tabindex="'+(dj.length?0:-1)+'" style="'+(dj.length?'cursor:pointer;':'cursor:default;')+'">'+
+      '<span class="d-num">'+d+'</span>'+
+      '<span class="cal-tile-info">'+(dj.length? dj.length+' job'+(dj.length===1?'':'s') : '—')+(crit?' · '+crit+' crit':'')+'</span>'+
+      (dj.length?'<span class="cal-count-badge">'+dj.length+'</span>':'')+
+      (crit?'<span class="cal-crit-badge">'+crit+'</span>':'')+
+    '</div>';
+  }
+  document.getElementById('view-month').innerHTML =
+    '<div class="breadcrumb"><a data-back>← All months</a></div>'+
+    '<div class="section-title">'+label+' — '+jobs.length+' jobs'+(jobs.filter(j=>j.critical).length?' · '+jobs.filter(j=>j.critical).length+' critical':'')+'</div>'+
+    (jobs.length?'<div class="cal-grid">'+DOW.map(d=>'<div class="cal-dow">'+d+'</div>').join('')+cells+'</div>':'<div class="empty-state"><div class="big-icon">⚓</div><div class="msg">No jobs scheduled this month</div></div>');
+  document.querySelector('[data-back]').addEventListener('click', ()=> go(()=>{ nav.monthBucket=null; }));
+  document.querySelectorAll('.cal-cell.has-jobs[data-date]').forEach(el=>{ const g=()=>openDayModal(el.dataset.date); el.addEventListener('click', g); el.addEventListener('keydown', e=>{ if(e.key==='Enter') g(); }); });
+}
+/* Month -> day: a real navigation entry so back returns to month-detail */
+function openDayModal(iso){
+  go(()=>{ nav.date=iso; nav.__dayModal=iso; });
+}
+/* render the day modal when nav.__dayModal is set (called from renderMonth path via render) */
+/* Simpler: openDayModal shows a modal but ALSO records history so back closes it. */
+
+/* We implement day view as a modal but tie it to history via a lightweight flag. */
+function showDayModalNow(iso){
+  const occs = occurrencesOnDate(iso).sort((a,b)=> jobSortKey(a.job,b.job));
+  const root=document.getElementById('modalRoot');
+  root.innerHTML =
+    '<div class="modal-overlay" id="dayOverlay"><div class="modal-sheet" onclick="event.stopPropagation()">'+
+      '<div class="modal-head"><h3>'+humanDate(iso)+'</h3><button class="icon-btn" id="dayClose">✕</button></div>'+
+      (isSaturday(iso)? '<div class="safety-banner" style="margin-bottom:12px;"><span class="sb-ic">🦺</span><span>'+(iso===TODAY?'Today is Safety Day':'Safety Day')+'</span></div>':'')+
+      '<div class="job-list" id="dayJobList">'+(occs.length? occs.map(o=>jobCard(o.job,{occDate:o.date, occStatus:o.status})).join('') : '<div class="empty-state"><div class="big-icon">⚓</div><div class="msg">No jobs due on this date.</div></div>')+'</div>'+
+    '</div></div>';
+  const close=()=>{ history.back(); };   // routed through popstate → pops to month-detail
+  document.getElementById('dayOverlay').addEventListener('click', close);
+  document.getElementById('dayClose').addEventListener('click', close);
+  attachJobActions(document.getElementById('dayJobList'));
+}
+
+/* ============================================================
+   VIEW: CRITICAL
+   ============================================================ */
+function renderCritical(){
+  const allCrit = sortJobs(visibleJobs().filter(j=>j.critical));
+  const months = Array.from(new Set(allCrit.map(j=>getJobDue(j).slice(0,7)))).sort();
+  const jobs = nav.critMonth==='all'? allCrit : allCrit.filter(j=>getJobDue(j).slice(0,7)===nav.critMonth);
+  const done=jobs.filter(j=>getStatus(j)==='done').length; const overdue=jobs.filter(isOverdue).length; const pct=jobs.length?Math.round(done/jobs.length*100):0;
+  document.getElementById('view-critical').innerHTML =
+    '<div class="section-title" style="color:var(--crit);">⚠️ Critical Jobs — '+allCrit.length+'</div>'+
+    '<div class="pill-row" id="critMonthBar"><button class="filter-pill crit-variant '+(nav.critMonth==='all'?'active':'')+'" data-cm="all">All Critical</button>'+
+      months.map(m=>{ const [y,mo]=m.split('-').map(Number); return '<button class="filter-pill crit-variant '+(nav.critMonth===m?'active':'')+'" data-cm="'+m+'">'+MON[mo-1].slice(0,3)+' '+y+'</button>'; }).join('')+'</div>'+
+    '<div class="stat-strip" style="grid-template-columns:repeat(3,1fr); margin-bottom:12px;">'+
+      '<div class="stat-card done"><div class="num">'+done+'</div><div class="label">Done</div></div>'+
+      '<div class="stat-card overdue"><div class="num">'+overdue+'</div><div class="label">Overdue</div></div>'+
+      '<div class="stat-card crit"><div class="num">'+pct+'%</div><div class="label">Progress</div></div></div>'+
+    '<div class="job-list" id="critJobList">'+(jobs.length? jobs.map(jobCard).join('') : '<div class="empty-state"><div class="big-icon">✓</div><div class="msg">No critical jobs here</div></div>')+'</div>';
+  document.querySelectorAll('#critMonthBar .filter-pill').forEach(btn=> btn.addEventListener('click', ()=>{ nav.critMonth=btn.dataset.cm; renderCritical(); }));
+  attachJobActions(document.getElementById('critJobList'));
+}
+
+/* ============================================================
+   VIEW: FOCUS (Motor Starters)
+   ============================================================ */
+function renderFocus(){
+  const jobs = visibleJobs().filter(isFocusJob);
+  const months = Array.from(new Set(jobs.map(j=>getJobDue(j).slice(0,7)))).sort();
+  if(!nav.focusMonth || !months.includes(nav.focusMonth)) nav.focusMonth = months[0];
+  const monthJobs = sortJobs(jobs.filter(j=>getJobDue(j).slice(0,7)===nav.focusMonth));
+  const permits = activePermits();
+  const permOpen = !!nav.focusPermitsOpen;
+  document.getElementById('view-focus').innerHTML =
+    '<div class="section-title">⚙️ Motor Starters — '+jobs.length+'</div>'+
+    (permits.length?
+      '<div class="home-panel" style="margin-bottom:14px; border-color:var(--permit);">'+
+        '<div class="permit-collapse-head'+(permOpen?'':' collapsed')+'" id="focusPermitHead">'+
+          '<h3 style="color:var(--permit);margin:0;">📋 PTW-06 Permits — '+permits.length+' pending</h3>'+
+          '<span class="pch-chev" style="color:var(--permit);font-size:14px;">▾</span>'+
+        '</div>'+
+        (permOpen? '<div id="focusPermitList" style="margin-top:12px;">'+permits.map(permitRow).join('')+'<button class="btn primary" id="focusPermitExport" style="margin-top:6px;">⬇ Export to Excel (.xls)</button></div>':'')+
+      '</div>':'')+
+    '<div class="pill-row">'+ (months.length? months.map(m=>{ const cnt=jobs.filter(j=>getJobDue(j).slice(0,7)===m).length; const [y,mo]=m.split('-').map(Number); return '<button class="filter-pill '+(m===nav.focusMonth?'active':'')+'" data-fm="'+m+'">'+MON[mo-1].slice(0,3)+' '+y+' <span class="cnt">'+cnt+'</span></button>'; }).join('') : '') +'</div>'+
+    '<div class="job-list" id="focusJobList">'+(monthJobs.length? monthJobs.map(jobCard).join('') : '<div class="empty-state"><div class="big-icon">⚙️</div><div class="msg">No motor-starter routines'+(months.length?' this month':'')+'</div></div>')+'</div>';
+  const ph=document.getElementById('focusPermitHead'); if(ph) ph.addEventListener('click', ()=>{ nav.focusPermitsOpen=!nav.focusPermitsOpen; renderFocus(); });
+  const pe=document.getElementById('focusPermitExport'); if(pe) pe.addEventListener('click', (e)=>{ e.stopPropagation(); exportPermitsXls(); });
+  document.querySelectorAll('#view-focus .filter-pill').forEach(el=> el.addEventListener('click', ()=>{ nav.focusMonth=el.dataset.fm; renderFocus(); }));
+  attachJobActions(document.getElementById('focusJobList'));
+  attachPermitActions(document.getElementById('view-focus'));
+}
+
+/* ============================================================
+   VIEW: MACHINES
+   ============================================================ */
+function renderMachines(){
+  if(nav.system && nav.machine){ renderMachineDetail(nav.system,nav.machine); return; }
+  if(nav.system){ renderMachineList(nav.system); return; }
+  renderSystemList();
+}
+function renderSystemList(){
+  const systems={};
+  visibleJobs().forEach(j=>{ if(!systems[j.system]) systems[j.system]={count:0,crit:0}; systems[j.system].count++; if(j.critical)systems[j.system].crit++; });
+  const names=Object.keys(systems).sort();
+  document.getElementById('view-machines').innerHTML =
+    '<div class="section-title">🔧 Systems ('+names.length+')</div><div class="system-grid" id="systemGrid">'+
+      names.map(n=>'<div class="system-card" data-sys="'+esc(n)+'" tabindex="0"><div class="s-name">'+esc(n)+'</div><div class="s-stats"><span class="s-count">'+systems[n].count+'</span><span class="s-label">jobs</span></div>'+(systems[n].crit?'<div class="s-crit">'+systems[n].crit+' critical</div>':'')+'</div>').join('')+
+    '</div>';
+  document.querySelectorAll('.system-card').forEach(el=>{ const g=()=> go(()=>{ nav.system=el.dataset.sys; nav.machine=null; }); el.addEventListener('click', g); el.addEventListener('keydown', e=>{ if(e.key==='Enter') g(); }); });
+}
+function renderMachineList(system){
+  const machines={};
+  RAW.filter(j=>j.system===system).forEach(j=>{ if(!machines[j.machine]) machines[j.machine]={count:0,crit:0,lastDone:null}; machines[j.machine].count++; if(j.critical)machines[j.machine].crit++; if(j.done&&(!machines[j.machine].lastDone||j.done>machines[j.machine].lastDone)) machines[j.machine].lastDone=j.done; });
+  const names=Object.keys(machines).sort();
+  document.getElementById('view-machines').innerHTML =
+    '<div class="breadcrumb"><a data-back-sys>← Systems</a> <span>/</span> <span>'+esc(system)+'</span></div><div class="section-title">'+esc(system)+'</div><div class="machine-grid">'+
+      names.map(n=>'<div class="machine-tile" data-mach="'+esc(n)+'" tabindex="0">'+
+        '<div class="mt-name">'+(machines[n].crit?'<span class="mt-crit-dot"></span>':'')+esc(n)+'</div>'+
+        '<div class="mt-stat"><div class="mt-k">Total Jobs</div><div class="mt-v">'+machines[n].count+'</div></div>'+
+        '<div class="mt-stat"><div class="mt-k">Last Maintenance</div><div class="mt-v last">'+(machines[n].lastDone?shortDate(machines[n].lastDone):'No record')+'</div></div>'+
+      '</div>').join('')+
+    '</div>';
+  document.querySelector('[data-back-sys]').addEventListener('click', ()=> go(()=>{ nav.system=null; }));
+  document.querySelectorAll('.machine-tile').forEach(el=>{ const g=()=> go(()=>{ nav.machine=el.dataset.mach; }); el.addEventListener('click', g); el.addEventListener('keydown', e=>{ if(e.key==='Enter') g(); }); });
+}
+function machineJobLastDone(j){ return (STATE.lastDone && STATE.lastDone[j.id]) || j.done || ''; }
+function renderMachineDetail(system,machine){
+  const jobs=sortJobs(RAW.filter(j=>j.system===system&&j.machine===machine));
+  const crit=jobs.filter(j=>j.critical).length;
+  // find the single most-recently maintained job (to tag it)
+  let recentJob=null, recentDate='';
+  jobs.forEach(j=>{ const d=machineJobLastDone(j); if(d && d>recentDate){ recentDate=d; recentJob=j; } });
+  const lastDone = recentDate || null;
+  document.getElementById('view-machines').innerHTML =
+    '<div class="breadcrumb"><a data-back-sys>← Systems</a> <span>/</span> <a data-back-mach>'+esc(system)+'</a> <span>/</span> <span>'+esc(machine)+'</span></div><div class="section-title">'+esc(machine)+'</div>'+
+    '<div class="stat-strip" style="grid-template-columns:repeat(3,1fr); margin-bottom:16px;"><div class="stat-card"><div class="num">'+jobs.length+'</div><div class="label">Total</div></div><div class="stat-card crit"><div class="num">'+crit+'</div><div class="label">Critical</div></div><div class="stat-card"><div class="num" style="font-size:14px;">'+(lastDone?shortDate(lastDone):'—')+'</div><div class="label">Last Maint.</div></div></div>'+
+    '<div class="job-list" id="machDetailList">'+jobs.map(j=>jobCard(j,{ noStatusCorner:true, lastMaint:(recentJob&&j.id===recentJob.id) })).join('')+'</div>';
+  document.querySelector('[data-back-sys]').addEventListener('click', ()=> go(()=>{ nav.system=null; nav.machine=null; }));
+  document.querySelector('[data-back-mach]').addEventListener('click', ()=> go(()=>{ nav.machine=null; }));
+  attachJobActions(document.getElementById('machDetailList'));
+}
+
+/* ============================================================
+   VIEW: UNIVERSAL SEARCH
+   ============================================================ */
+function renderSearch(){
+  const q = nav.searchQuery||'';
+  document.getElementById('view-search').innerHTML =
+    '<div class="section-title">🔍 Search</div>'+
+    '<input type="text" class="search-box" id="uniSearch" placeholder="Search item, machine, system, date (e.g. 17 Jul or 2026-07-17)..." value="'+esc(q)+'">'+
+    '<div id="searchResults"></div>';
+  const input = document.getElementById('uniSearch');
+  input.addEventListener('input', ()=>{ nav.searchQuery=input.value; runSearch(input.value); });
+  input.focus();
+  runSearch(q);
+}
+/* Try to read a date fragment from a token/query. Returns {day,mon,year} partial or null.
+   Understands: 2026-08-06, 6-8, 6/8, "6 aug", "6aug", "aug 6", "6 august 2026". */
+const MON_ABBR = MON.map(m=>m.slice(0,3).toLowerCase());
+function parseDateQuery(q){
+  q = q.toLowerCase().trim();
+  // ISO or partial ISO: 2026-08-06 / 2026-08 / 2026
+  let m = q.match(/^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?$/);
+  if(m) return { year:+m[1], mon:m[2]?+m[2]:null, day:m[3]?+m[3]:null };
+  // day + month-name (either order): "6 aug", "aug 6", "6 august 2026"
+  const monName = MON_ABBR.find(a=> new RegExp('\\b'+a).test(q));
+  if(monName){
+    const monIdx = MON_ABBR.indexOf(monName)+1;
+    const dm = q.match(/\b(\d{1,2})\b/);
+    const ym = q.match(/\b(\d{4})\b/);
+    return { year:ym?+ym[1]:null, mon:monIdx, day:(dm && (!ym || dm[1]!==ym[1]))?+dm[1]:null };
+  }
+  // numeric d-m or d/m (day first)
+  m = q.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
+  if(m){ let y=m[3]?+m[3]:null; if(y&&y<100) y+=2000; return { day:+m[1], mon:+m[2], year:y }; }
+  return null;
+}
+function runSearch(q){
+  const box = document.getElementById('searchResults');
+  const raw = String(q||'').trim();
+  if(!raw){ box.innerHTML = '<div class="empty-state"><div class="big-icon">🔍</div><div class="msg">Type to search</div><div class="sub">Item, machine, system, work — words can be in any order. Or a due date like "6 Aug".</div></div>'; return; }
+
+  // If the whole query parses as a date → precise date filter over ALL occurrences
+  const wholeDate = parseDateQuery(raw);
+  let cards;
+  if(wholeDate){
+    const occs=[];
+    visibleJobs().forEach(job=>{
+      occurrencesOf(job).forEach(o=>{ const d=parseISO(o.date);
+        if(wholeDate.year!=null && d.getFullYear()!==wholeDate.year) return;
+        if(wholeDate.mon!=null && (d.getMonth()+1)!==wholeDate.mon) return;
+        if(wholeDate.day!=null && d.getDate()!==wholeDate.day) return;
+        occs.push({job, date:o.date, status:o.status});
+      });
+    });
+    occs.sort((a,b)=> a.date.localeCompare(b.date) || jobSortKey(a.job,b.job));
+    cards = occs.map(o=>({html:jobCard(o.job,{occDate:o.date, occStatus:o.status})}));
+    if(!occs.length){ box.innerHTML='<div class="empty-state"><div class="big-icon">🚫</div><div class="msg">No jobs on that date</div></div>'; return; }
+    box.innerHTML='<div class="section-title" style="font-size:14px;">'+occs.length+' on '+esc(raw)+' · date match</div><div class="job-list" id="searchJobList">'+cards.map(c=>c.html).join('')+'</div>';
+    attachJobActions(document.getElementById('searchJobList'));
+    return;
+  }
+  // multi-word text search over live occurrences
+  const words = raw.toLowerCase().split(/\s+/).filter(Boolean);
+  let results = visibleJobs().filter(j=>{
+    const due = getJobDue(j);
+    const hay = (j.item+' '+j.machine+' '+j.system+' '+j.group_full+' '+j.work+' '+j.dept+' '+intervalLabel(j.interval)+' '+due+' '+shortDate(due)+' '+shortDateNoYear(due)).toLowerCase();
+    return words.every(w=> hay.includes(w));
+  });
+  results = sortJobs(results);
+  if(!results.length){ box.innerHTML = '<div class="empty-state"><div class="big-icon">🚫</div><div class="msg">No matches for "'+esc(raw)+'"</div></div>'; return; }
+  box.innerHTML = '<div class="section-title" style="font-size:14px;">'+results.length+' result'+(results.length===1?'':'s')+'</div><div class="job-list" id="searchJobList">'+results.map(j=>jobCard(j)).join('')+'</div>';
+  attachJobActions(document.getElementById('searchJobList'));
+}
+
+/* ============================================================
+   VIEW: SETTINGS
+   ============================================================ */
+function renderSettings(){
+  const doneCount=Object.values(STATE.statuses).filter(s=>s==='done').length;
+  const postponedCount=Object.values(STATE.statuses).filter(s=>s==='postponed').length;
+  const sinceStr = IMPORT_META.reportDate ? shortDate(IMPORT_META.reportDate) : '10 Jul 2026';
+  document.getElementById('view-settings').innerHTML =
+    '<div class="section-title">⚙ Settings</div>'+
+    '<div class="panel settings-block"><h4>Import Jobs — CSV or JSON</h4>'+
+      '<p>Currently loaded: <b>'+RAW.length+'</b> job'+(RAW.length===1?'':'s')+'. Import your PMS export directly as <b>PMS_DATA.csv</b> (raw software export) — converted automatically — or a filtered <b>.txt/.json</b> job list.</p>'+
+      '<button class="btn primary" id="importJobsBtn">⬆ Import PMS_DATA.csv / JSON</button><button class="btn danger" id="resetJobsBtn">Reset to sample data</button>'+
+      '<input type="file" id="importJobsFile" accept=".csv,.txt,.json,application/json,text/csv"></div>'+
+    '<div class="panel settings-block"><h4>Estimated Sign-Off</h4>'+
+      '<p>Jobs due after this date are hidden everywhere, so you only see what\'s relevant to your time on board.</p>'+
+      '<div class="cp-date-row" style="max-width:260px;"><input type="date" id="signOffInput" value="'+(STATE.signOffDate||'')+'"></div>'+
+      '<div style="margin-top:10px;"><button class="btn primary" id="signOffSaveBtn">Save sign-off date</button>'+(STATE.signOffDate?'<button class="btn" id="signOffClearBtn">Clear</button>':'')+'</div>'+
+      (STATE.signOffDate?'<p style="margin-top:10px;margin-bottom:0;">Hiding jobs due after <b>'+shortDate(STATE.signOffDate)+'</b>.</p>':'')+'</div>'+
+    '<div class="panel settings-block"><h4>Appearance</h4><p>Switch between dark and light mode. Remembered on this device. Tip: double-tap Spacebar to toggle.</p><button class="btn" id="settingsThemeToggle">Toggle theme</button></div>'+
+    '<div class="panel settings-block"><h4>Sync between PC and Mobile</h4><p><b>'+doneCount+'</b> done · <b>'+postponedCount+'</b> postponed · <b>'+activePermits().length+'</b> open permits. Export your progress + permits to carry between devices.</p><button class="btn primary" id="exportBtn">⬇ Export progress (JSON)</button><button class="btn" id="importBtn">⬆ Import progress</button><input type="file" id="importFile" accept="application/json,.json"></div>'+
+    '<div class="panel settings-block"><h4>Export as CSV</h4><p>Export the full job list with current status.</p><button class="btn" id="exportCsvBtn">⬇ Export CSV</button></div>'+
+    '<div class="panel settings-block"><h4>About</h4><p style="font-family:var(--font-mono);font-size:11.5px;">Vessel: '+esc(IMPORT_META.vessel||'M.V. Seaways Mirage')+'<br>Company: '+esc(IMPORT_META.company||'Anglo-Eastern Tanker Management')+'<br>Total PMS items: '+RAW.length+'<br><b>This data starts from '+sinceStr+'</b> (PMS export date)<br><br>This app is developed by ETO.</p></div>';
+
+  document.getElementById('settingsThemeToggle').addEventListener('click', toggleTheme);
+  document.getElementById('importJobsBtn').addEventListener('click', ()=> document.getElementById('importJobsFile').click());
+  document.getElementById('importJobsFile').addEventListener('change', e=>{
+    const file=e.target.files[0]; if(!file) return;
+    const reader=new FileReader();
+    reader.onload=()=>{
+      try{
+        const res = importAnyFormat(reader.result);
+        if(!res.jobs || !res.jobs.length){ toast('No jobs found in file'); return; }
+        RAW = res.jobs;
+        if(res.vessel||res.company||res.reportDate){ IMPORT_META={ vessel:res.vessel, company:res.company, reportDate:res.reportDate }; }
+        try{ localStorage.setItem(IMPORTED_JOBS_KEY, JSON.stringify(RAW)); localStorage.setItem(META_KEY, JSON.stringify(IMPORT_META)); }catch(err){}
+        refreshHeader();
+        toast('Imported '+RAW.length+' jobs');
+        renderNav(); renderCurrentView();
+      }catch(err){ toast('Could not read file — expected PMS CSV or JSON'); }
+    };
+    reader.readAsText(file);
+  });
+  document.getElementById('resetJobsBtn').addEventListener('click', ()=>{
+    RAW=JSON.parse(document.getElementById('pms-data').textContent); IMPORT_META={vessel:null,company:null,reportDate:null};
+    try{ localStorage.removeItem(IMPORTED_JOBS_KEY); localStorage.removeItem(META_KEY); }catch(err){}
+    refreshHeader(); toast('Reset to sample data'); renderNav(); renderCurrentView();
+  });
+  document.getElementById('signOffSaveBtn').addEventListener('click', ()=>{ STATE.signOffDate=document.getElementById('signOffInput').value||null; saveState(); toast(STATE.signOffDate?'Sign-off date saved':'Sign-off cleared'); renderSettings(); });
+  const cbtn=document.getElementById('signOffClearBtn'); if(cbtn) cbtn.addEventListener('click', ()=>{ STATE.signOffDate=null; saveState(); toast('Sign-off cleared'); renderSettings(); });
+  document.getElementById('exportBtn').addEventListener('click', ()=>{ downloadBlob(new Blob([JSON.stringify(STATE,null,2)],{type:'application/json'}),'pms_progress_'+TODAY+'.json'); toast('Progress exported'); });
+  document.getElementById('importBtn').addEventListener('click', ()=> document.getElementById('importFile').click());
+  document.getElementById('importFile').addEventListener('change', e=>{
+    const file=e.target.files[0]; if(!file) return; const reader=new FileReader();
+    reader.onload=()=>{ try{ const imp=JSON.parse(reader.result); if(imp&&typeof imp==='object'){
+      if(imp.statuses) STATE.statuses=imp.statuses; if(imp.jobMeta) STATE.jobMeta=imp.jobMeta; if(imp.jobDueOverride) STATE.jobDueOverride=imp.jobDueOverride; if(imp.permits) STATE.permits=imp.permits; if('signOffDate' in imp) STATE.signOffDate=imp.signOffDate; if(imp.theme) STATE.theme=imp.theme;
+      saveState(); toast('Progress imported'); renderNav(); renderCurrentView(); } else toast('Invalid file'); }catch(err){ toast('Could not read file'); } };
+    reader.readAsText(file);
+  });
+  document.getElementById('exportCsvBtn').addEventListener('click', ()=>{
+    const header=['System','Machine','PMS Item','Work','Done','Due','Interval','Critical','Status'];
+    const lines=[header.join(',')];
+    RAW.forEach(j=>{ const status=getStatus(j)||'pending'; const row=[j.system,j.machine,j.item,j.work,j.done||'',getJobDue(j),j.interval,j.critical?'Y':'',status].map(v=>'"'+String(v).replace(/"/g,'""')+'"'); lines.push(row.join(',')); });
+    downloadBlob(new Blob([lines.join('\n')],{type:'text/csv'}),'pms_status_'+TODAY+'.csv'); toast('CSV exported');
+  });
+}
+function downloadBlob(blob,filename){ const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url); }
+
+/* ============================================================
+   THEME
+   ============================================================ */
+function applyTheme(theme){
+  if(theme==='light') document.body.setAttribute('data-theme','light'); else document.body.removeAttribute('data-theme');
+  document.getElementById('themeToggle').textContent = theme==='light' ? '🌙' : '☀️';
+  const meta=document.querySelector('meta[name=theme-color]'); if(meta) meta.setAttribute('content', theme==='light'?'#f0f2f5':'#09111f');
+}
+function toggleTheme(){ const cur=document.body.getAttribute('data-theme')==='light'?'light':'dark'; const next=cur==='light'?'dark':'light'; STATE.theme=next; saveState(); applyTheme(next); }
+function initTheme(){ applyTheme(STATE.theme||'dark'); }
+
+/* ============================================================
+   TOAST
+   ============================================================ */
+let toastTimer=null;
+function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; el.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.classList.remove('show'),1800); }
+
+/* ============================================================
+   HEADER
+   ============================================================ */
+function refreshHeader(){
+  document.getElementById('vesselName').textContent = (IMPORT_META.vessel||'M.V. SEAWAYS MIRAGE').toUpperCase();
+  document.getElementById('companyName').textContent = IMPORT_META.company||'Anglo-Eastern Tanker Management';
+  const since = IMPORT_META.reportDate ? shortDate(IMPORT_META.reportDate) : '10 Jul 2026';
+  document.getElementById('sinceLine').textContent = 'Since '+since+' · '+RAW.length+' items';
+}
+
+/* ============================================================
+   KEYBOARD  (desktop) + is-desktop detection
+   ============================================================ */
+function detectDesktop(){
+  const isTouch = matchMedia('(pointer:coarse)').matches || navigator.maxTouchPoints>0;
+  const wide = window.innerWidth>900;
+  document.body.classList.toggle('is-desktop', !isTouch && wide);
+}
+let lastSpaceTime=0, lastSTime=0;
+document.addEventListener('keydown', e=>{
+  const tag=(document.activeElement&&document.activeElement.tagName||'').toLowerCase();
+  if(tag==='input'||tag==='select'||tag==='textarea') return;
+  if(nav.tab==='daily' && (e.key==='ArrowLeft'||e.key==='ArrowRight')){ e.preventDefault(); navDay(e.key==='ArrowLeft'?-1:1); return; }
+  if(e.code==='Space'||e.key===' '){ const now=Date.now(); if(now-lastSpaceTime<2000){ e.preventDefault(); toggleTheme(); lastSpaceTime=0; } else lastSpaceTime=now; return; }
+  // double-S → open search
+  if(e.key==='s'||e.key==='S'){ const now=Date.now(); if(now-lastSTime<2000){ e.preventDefault(); switchTab('search'); lastSTime=0; } else lastSTime=now; }
+});
+
+/* ============================================================
+   HARDWARE / BROWSER BACK BUTTON
+   ============================================================ */
+window.addEventListener('popstate', ()=>{
+  const modal=document.getElementById('modalRoot');
+  const pop=document.getElementById('popoverRoot');
+  // 1) a transient popover (complete dialog) closes first, consumes the back
+  if(pop.innerHTML){ pop.innerHTML=''; history.pushState({depth:HISTORY.length}, ''); return; }
+  // 2) a standalone modal not tracked by nav (permit / counter list) closes, consumes the back
+  if(modal.innerHTML && !nav.__dayModal){ modal.innerHTML=''; history.pushState({depth:HISTORY.length}, ''); return; }
+  // 3) walk our logical history
+  if(HISTORY.length>0){
+    const prev=HISTORY.pop();
+    modal.innerHTML='';          // clear any day-modal; render() re-shows if the target still wants it
+    applySnapshot(prev);
+    render();
+    history.pushState({depth:HISTORY.length}, '');   // keep a live entry so the next back fires
+  } else if(nav.tab!=='home'){
+    // no history but not on home → land on home, still capture next back
+    modal.innerHTML='';
+    Object.assign(nav,{tab:'home', system:null, machine:null, monthBucket:null, __dayModal:null});
+    render();
+    history.pushState({depth:0}, '');
+  } else {
+    // on home with empty history → ask before exiting (keep a live entry so we stay put)
+    history.pushState({depth:0}, '');
+    showExitPopup();
+  }
+});
+/* bottom exit confirmation */
+function showExitPopup(){
+  if(document.getElementById('exitOverlay')) return;
+  const root=document.getElementById('popoverRoot');
+  root.innerHTML =
+    '<div class="sheet-overlay" id="exitOverlay"></div>'+
+    '<div class="exit-sheet">'+
+      '<div class="exit-title">Exit PMS Dashboard?</div>'+
+      '<div class="exit-actions"><button class="btn" id="exitCancel">Cancel</button><button class="btn danger" id="exitOk">Exit</button></div>'+
+    '</div>';
+  document.getElementById('exitOverlay').addEventListener('click', ()=>{ root.innerHTML=''; });
+  document.getElementById('exitCancel').addEventListener('click', ()=>{ root.innerHTML=''; });
+  document.getElementById('exitOk').addEventListener('click', ()=>{
+    root.innerHTML='';
+    // best-effort close; browsers may block window.close() for non-script-opened tabs
+    try{ window.close(); }catch(e){}
+    // as a fallback, go back far enough to leave the app
+    history.go(-(HISTORY.length+2));
+  });
+}
+
+/* ============================================================
+   INIT
+   ============================================================ */
+function init(){
+  detectDesktop();
+  window.addEventListener('resize', ()=>{ detectDesktop(); moveNavSlider(); });
+  initTheme();
+  reflashPostponedPermits();
+  refreshHeader();
+  document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+  document.getElementById('permitBell').addEventListener('click', openPermitModal);
+
+  // chip zone: toggle open/closed; auto-collapse when tapping elsewhere or scrolling content
+  const chipToggle = document.getElementById('chipToggle');
+  if(chipToggle) chipToggle.addEventListener('click', (e)=>{ e.stopPropagation(); toggleChips(); });
+  const chipSearch = document.getElementById('chipSearch');
+  if(chipSearch) chipSearch.addEventListener('click', (e)=>{ e.stopPropagation(); switchTab('search'); });
+  document.getElementById('content').addEventListener('click', ()=>{ collapseChips(); unflipCurrent(); }, true);
+  window.addEventListener('scroll', ()=>{ collapseChips(); unflipCurrent(); }, {passive:true});
+  document.getElementById('content').addEventListener('touchmove', ()=>{ collapseChips(); unflipCurrent(); }, {passive:true});
+
+  renderNav();
+  render();
+  updatePermitBell();
+  // seed one browser-history entry so the first hardware back is captured
+  history.replaceState({depth:0}, '');
+  history.pushState({depth:0}, '');
+  if(activePermits().length){ setTimeout(()=>toast('📋 '+activePermits().length+' PTW-06 permit(s) pending'), 700); }
+
+  // Register service worker for offline / installable PWA (only over http/https)
+  if('serviceWorker' in navigator && location.protocol.startsWith('http')){
+    window.addEventListener('load', ()=>{ navigator.serviceWorker.register('service-worker.js').catch(()=>{}); });
+  }
+}
+
+init();
+
+})();

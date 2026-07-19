@@ -1,0 +1,13 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# Node / tooling (not used by the app, but just in case)
+node_modules/
+npm-debug.log*
+
+# Local scratch
+*.log
