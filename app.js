@@ -7,7 +7,7 @@
 "use strict";
 
 /* ---------- App version ---------- */
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 
 /* ---------- Storage keys ---------- */
 const IMPORTED_JOBS_KEY = 'pms_dashboard_imported_jobs_v3';
@@ -40,9 +40,8 @@ STATE.jobMeta       = STATE.jobMeta       || {};
 STATE.jobDueOverride= STATE.jobDueOverride|| {};
 STATE.permits       = STATE.permits       || {};
 STATE.lastDone      = STATE.lastDone      || {};   // id -> most recent done date (for machine view)
-STATE.machineHours  = STATE.machineHours  || {};   // machineKey -> current running hours (user-updated)
-STATE.machineHoursBase = STATE.machineHoursBase || {}; // machineKey -> hours reading when first set (baseline)
-STATE.hoursJobBase  = STATE.hoursJobBase  || {};   // id -> job's accumulated hrs at that baseline (for cycle reset)
+STATE.machineHoursAdded = STATE.machineHoursAdded || {}; // machineKey -> cumulative hours the user has added since import (running total of increments)
+STATE.hoursJobBase  = STATE.hoursJobBase  || {};   // id -> job's own accumulated hrs snapshot at its last reset (completing a job snaps this so its counter restarts at 0)
 STATE.hoursDueDate  = STATE.hoursDueDate  || {};   // id -> ISO date the hours-job first crossed its interval (its due date)
 STATE.importantDates= STATE.importantDates|| [];   // [{id, date:ISO, text}] user-added reminders (Home)
 if(STATE.soundOn   ===undefined) STATE.soundOn   = true;   // tap sound on nav switch (default ON)
@@ -206,15 +205,22 @@ function importAnyFormat(text){
 }
 
 /* ============================================================
-   RUNNING-HOURS ENGINE
+   RUNNING-HOURS ENGINE  (simple additive model)
    Some jobs are due by machine running-hours (interval like "2000 H"), not by
-   calendar date. The user updates each machine's current running hours in
-   Settings. A job's accumulated hours = its hrs-run at import + how far the
-   machine counter has advanced since the user first entered a reading for it.
-   When accumulated >= interval, the job becomes due (dated the day it crossed).
+   calendar date. Each such job carries its own accumulated hours at import
+   (job.hrsRun, e.g. 366 / 2000). The user, in Running Hours, enters how many
+   NEW hours the machine has run since the last update — those hours add to
+   every hours-job on that machine. We keep a per-machine running total of all
+   the increments the user has entered (STATE.machineHoursAdded[key]).
+
+     job accumulated = job.hrsRun  +  machine's added hours  −  reset offset
+     job is DUE when  accumulated >= its interval
+
+   Completing a job snaps its reset offset to the current accumulated value, so
+   that job's counter restarts at 0 while the machine keeps climbing.
    ============================================================ */
 function machineKey(job){ return job.group_full; }
-/* machines that actually carry running-hours jobs (for the Settings updater) */
+/* machines that actually carry running-hours jobs (for the updater) */
 function hoursMachines(){
   const map = new Map();   // key -> {system, machine, key, jobs:[], maxInterval}
   RAW.forEach(j=>{
@@ -226,39 +232,40 @@ function hoursMachines(){
   });
   return Array.from(map.values()).sort((a,b)=> a.machine.localeCompare(b.machine));
 }
-/* how far a machine's counter has advanced since the user first set it */
-function machineDelta(key){
-  const cur = STATE.machineHours[key];
-  const base = STATE.machineHoursBase[key];
-  if(cur==null || base==null) return 0;
-  return Math.max(0, cur - base);
-}
+/* total hours the user has added to this machine since import */
+function machineAdded(key){ const v = STATE.machineHoursAdded[key]; return v!=null ? v : 0; }
 /* a running-hours job's current accumulated hours toward its interval */
 function jobAccumHours(job){
-  const baseAcc = (STATE.hoursJobBase[job.id]!=null) ? STATE.hoursJobBase[job.id]
-                : (job.hrsRun!=null ? job.hrsRun : 0);
-  return baseAcc + machineDelta(machineKey(job));
+  const csvBase = (job.hrsRun!=null ? job.hrsRun : 0);
+  const resetOffset = (STATE.hoursJobBase[job.id]!=null ? STATE.hoursJobBase[job.id] : 0);
+  return Math.max(0, csvBase + machineAdded(machineKey(job)) - resetOffset);
+}
+/* same as jobAccumHours but with a hypothetical extra increment not yet saved */
+function jobAccumHoursPreview(job, extraHours){
+  const csvBase = (job.hrsRun!=null ? job.hrsRun : 0);
+  const resetOffset = (STATE.hoursJobBase[job.id]!=null ? STATE.hoursJobBase[job.id] : 0);
+  return Math.max(0, csvBase + machineAdded(machineKey(job)) + (extraHours||0) - resetOffset);
 }
 /* recompute due-dates for hours jobs after a machine's hours change.
    Sets STATE.hoursDueDate[id] = TODAY the first time a job crosses its interval;
-   clears it if the job falls back below (e.g. baseline corrected). */
+   clears it if the job falls back below (e.g. after a reset). */
 function recomputeHoursDue(){
   let changed=false;
   RAW.forEach(j=>{
     if(!isHoursJob(j)) return;
     const iv = intervalHours(j.interval); if(!iv) return;
+    if(getStatus(j)==='done') return;   // already completed this cycle, waiting to be re-crossed
     const due = jobAccumHours(j) >= iv;
     if(due && !STATE.hoursDueDate[j.id]){ STATE.hoursDueDate[j.id]=TODAY; changed=true; }
     else if(!due && STATE.hoursDueDate[j.id]){ delete STATE.hoursDueDate[j.id]; changed=true; }
   });
   if(changed) saveState();
 }
-/* set a machine's current running hours (first call establishes the baseline) */
-function setMachineHours(key, hours){
+/* add NEW running hours to a machine (increment). Returns the new machine total added. */
+function addMachineHours(key, hours){
   hours = Number(hours);
-  if(isNaN(hours) || hours<0) return false;
-  if(STATE.machineHoursBase[key]==null) STATE.machineHoursBase[key]=hours;   // baseline = first reading
-  STATE.machineHours[key]=hours;
+  if(isNaN(hours) || hours<=0) return false;
+  STATE.machineHoursAdded[key] = machineAdded(key) + hours;
   saveState();
   recomputeHoursDue();
   return true;
@@ -445,12 +452,13 @@ function moveNavSlider(){
   if(!slider) return;
   const active = bar.querySelector('.nav-item.active');
   if(active){
-    // The slider (left:0) sits at the bar's padding edge; nav-item.offsetLeft is
-    // measured from the bar's border edge — so subtract the bar's left padding to
-    // land the pill perfectly centered over each equal-width slot.
-    const padL = parseFloat(getComputedStyle(bar).paddingLeft) || 0;
-    slider.style.width = Math.round(active.getBoundingClientRect().width)+'px';
-    slider.style.transform = 'translateX('+ Math.round(active.offsetLeft - padL) +'px)';
+    // The slider and every nav-item share the same offsetParent (the bar), and
+    // the slider sits at left:0 (offsetLeft 0). offsetLeft is measured from the
+    // bar's padding edge for both, so the active item's offsetLeft is exactly how
+    // far to slide — independent of the bar's padding, border, and inter-item gap.
+    // getBoundingClientRect().width gives the true rendered (sub-pixel) width.
+    slider.style.width = active.getBoundingClientRect().width + 'px';
+    slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
     slider.style.opacity = '1';
   } else {
     slider.style.opacity = '0';
@@ -610,9 +618,12 @@ function completeJob(id, opts){
   STATE.lastDone[id] = doneDate;
   // 2) advance the cycle → next due becomes a fresh (pending) occurrence
   if(isHoursJob(job)){
-    // reset accumulated hours to 0 relative to the machine's current reading,
-    // and clear the due date so it drops off the calendar until it crosses again
-    STATE.hoursJobBase[id] = -machineDelta(machineKey(job));
+    // reset this job's accumulated hours to 0: snap its reset offset to the
+    // job's current total (csvBase + machine's added hours). It starts counting
+    // up again from 0 while the machine keeps climbing. Clear its due date so it
+    // drops off the calendar until it crosses its interval again.
+    const csvBase = (job.hrsRun!=null ? job.hrsRun : 0);
+    STATE.hoursJobBase[id] = csvBase + machineAdded(machineKey(job));
     delete STATE.hoursDueDate[id];
   } else {
     const months = intervalToMonths(job.interval);
@@ -799,15 +810,17 @@ function openCompletePopup(jobId){
 
 /* ============================================================
    BATCH SAME-DAY UPDATE
-   After completing one job, sibling jobs on the SAME machine (same group_full)
+   After completing one job, sibling jobs in the SAME SYSTEM (same j.system)
    that are ALSO due (due on-or-before the done date) and still pending get
    offered the same done date. All ticked by default; user can untick any.
+   Grouping by system (not the machine sub-group) so a whole system's due jobs
+   can be knocked out together.
    ============================================================ */
 function batchSiblings(sourceId, doneDate){
   const src = RAW.find(j=>j.id===sourceId); if(!src) return [];
   return RAW.filter(j=>{
     if(j.id===sourceId) return false;
-    if(j.group_full!==src.group_full) return false;   // same machine sub-group only
+    if(j.system!==src.system) return false;            // same SYSTEM (all machines under it)
     if(!isScheduled(j)) return false;                  // hours-jobs not yet due are skipped
     if(getStatus(j)==='done') return false;            // already done this cycle
     const due = getJobDue(j);
@@ -836,20 +849,30 @@ function maybeOfferBatchSameDay(sourceId, doneDate, location){
     '<div class="complete-sheet" id="batchSheet">'+
       '<div class="cs-grip"></div>'+
       '<div class="cs-title">Also done on '+shortDate(doneDate)+'?</div>'+
-      '<div class="batch-note">These jobs on <b>'+esc(src.machine)+'</b> are also due. Untick any you didn\'t do. Ticked jobs will be marked complete on <b>'+shortDate(doneDate)+'</b>.</div>'+
+      '<div class="batch-note">Other due jobs in <b>'+esc(src.system)+'</b>. Untick any you didn\'t do. Ticked jobs will be marked complete on <b>'+shortDate(doneDate)+'</b>.</div>'+
       '<div class="batch-list" id="batchList">'+rows+'</div>'+
       '<div class="cs-actions"><button class="btn" id="batchSkip">Skip</button><button class="btn primary" id="batchApply">Apply to selected</button></div>'+
     '</div>';
   const close=()=>{ root.innerHTML=''; };
   document.getElementById('batchOverlay').addEventListener('click', close);
   document.getElementById('batchSkip').addEventListener('click', close);
-  root.querySelectorAll('.batch-item').forEach(it=> it.addEventListener('click', ()=> it.classList.toggle('checked')));
+  root.querySelectorAll('.batch-item').forEach(it=> it.addEventListener('click', ()=>{ if(it.classList.contains('applied')) return; it.classList.toggle('checked'); }));
   document.getElementById('batchApply').addEventListener('click', ()=>{
-    const ids = Array.from(root.querySelectorAll('.batch-item.checked')).map(el=>Number(el.dataset.bid));
+    const checked = Array.from(root.querySelectorAll('.batch-item.checked'));
+    const ids = checked.map(el=>Number(el.dataset.bid));
+    if(!ids.length){ close(); return; }
     ids.forEach(id=> completeJob(id, {location, doneDate}));
-    close();
-    if(ids.length) toast(ids.length+' more marked complete');
-    refreshAll();
+    // Confirm visually: turn every applied row solid-green + "Done", lock it,
+    // so the user sees the whole batch go green before the sheet closes.
+    checked.forEach(el=>{
+      el.classList.add('applied');
+      const due = el.querySelector('.bi-due');
+      if(due){ due.textContent = 'Done '+shortDate(doneDate); due.classList.add('done'); }
+    });
+    const apply = document.getElementById('batchApply');
+    if(apply){ apply.textContent = '✓ Done'; apply.disabled = true; }
+    toast(ids.length+' more marked complete');
+    setTimeout(()=>{ close(); refreshAll(); }, 750);
   });
 }
 /* wheel: snap-scroll; the centered item is the selected value */
@@ -1381,10 +1404,12 @@ function renderMachineDetail(system,machine){
 
 /* ============================================================
    VIEW: RUNNING HOURS  (own section — pill menu ⏱️)
-   User enters each machine's CURRENT total counter reading. The accumulated
-   hours for every hours-based job = its CSV base + how far the counter has
-   advanced since baseline. The readout updates INSTANTLY as the user types,
-   and pressing Update persists it (marking any newly-crossed jobs as due).
+   The user enters how many NEW hours a machine has run since the last update.
+   Those hours add to every hours-job on the machine. Each job's accumulated
+   hours = its CSV base + the machine's total added hours (minus any reset), and
+   the job becomes DUE the moment that reaches its interval. A due job can be
+   completed right here (swipe or tap Done), which resets that job's counter
+   to 0 while the machine keeps climbing. The bars preview live as you type.
    ============================================================ */
 function rhJobLine(j){
   const iv=intervalHours(j.interval)||0; const acc=jobAccumHours(j);
@@ -1392,22 +1417,14 @@ function rhJobLine(j){
   const pct = iv? Math.min(100, Math.round(acc/iv*100)) : 0;
   const stateCls = due? 'rh-due' : (pct>=80?'rh-soon':'');
   return '<div class="rh-job '+stateCls+'" data-rh-job="'+j.id+'">'+
-      '<div class="rh-job-name">'+esc(j.item)+'</div>'+
-      '<div class="rh-job-meter"><div class="rh-meter-track"><div class="rh-meter-fill" style="width:'+pct+'%"></div></div>'+
-        '<span class="rh-job-num">'+acc.toLocaleString()+' / '+iv.toLocaleString()+' h</span></div>'+
-      (due? '<span class="rh-badge">DUE '+shortDateNoYear(due)+'</span>' : '<span class="rh-remain">'+Math.max(0,iv-acc).toLocaleString()+' h left</span>')+
+      '<div class="rh-job-main">'+
+        '<div class="rh-job-name">'+esc(j.item)+'</div>'+
+        '<div class="rh-job-meter"><div class="rh-meter-track"><div class="rh-meter-fill" style="width:'+pct+'%"></div></div>'+
+          '<span class="rh-job-num">'+acc.toLocaleString()+' / '+iv.toLocaleString()+' h</span></div>'+
+        (due? '<span class="rh-badge">DUE '+shortDateNoYear(due)+'</span>' : '<span class="rh-remain">'+Math.max(0,iv-acc).toLocaleString()+' h left</span>')+
+      '</div>'+
+      (due? '<button class="rh-done-btn" data-rh-done="'+j.id+'" aria-label="Mark done">✓ Done</button>' : '')+
     '</div>';
-}
-/* preview accumulated hours for a job GIVEN a hypothetical counter value (not yet saved) */
-function jobAccumHoursPreview(job, previewCounter){
-  const key = machineKey(job);
-  const base = STATE.machineHoursBase[key];
-  const baseAcc = (STATE.hoursJobBase[job.id]!=null) ? STATE.hoursJobBase[job.id]
-                : (job.hrsRun!=null ? job.hrsRun : 0);
-  // if no baseline yet, the first reading establishes it → delta 0
-  const effectiveBase = (base==null) ? previewCounter : base;
-  const delta = Math.max(0, previewCounter - effectiveBase);
-  return baseAcc + delta;
 }
 function renderRunningHours(){
   const machines = hoursMachines();
@@ -1420,73 +1437,91 @@ function renderRunningHours(){
     return;
   }
   const rows = machines.map(mc=>{
-    const cur = STATE.machineHours[mc.key];
+    const added = machineAdded(mc.key);
     const jobLines = mc.jobs.slice().sort((a,b)=>(intervalHours(a.interval)||0)-(intervalHours(b.interval)||0)).map(rhJobLine).join('');
     return '<div class="rh-machine" data-rh-machine="'+esc(mc.key)+'">'+
         '<div class="rh-head"><div class="rh-mname">'+esc(mc.machine)+'</div><div class="rh-sys">'+esc(mc.system)+'</div></div>'+
         '<div class="rh-input-row">'+
-          '<label>Current running hours (counter reading)</label>'+
-          '<input type="number" inputmode="numeric" min="0" step="1" class="rh-input" data-mkey="'+esc(mc.key)+'" value="'+(cur!=null?cur:'')+'" placeholder="e.g. 2400">'+
-          '<button class="btn primary rh-save" data-mkey="'+esc(mc.key)+'">Update</button>'+
+          '<label>Add running hours (new hours since last update)</label>'+
+          '<div class="rh-input-line">'+
+            '<input type="number" inputmode="numeric" min="0" step="1" class="rh-input" data-mkey="'+esc(mc.key)+'" value="" placeholder="e.g. 40">'+
+            '<button class="btn primary rh-save" data-mkey="'+esc(mc.key)+'">Add</button>'+
+          '</div>'+
         '</div>'+
         '<div class="rh-preview" data-rh-preview="'+esc(mc.key)+'" style="display:none;"></div>'+
-        (cur!=null?'<div class="rh-current">Last set to <b>'+Number(cur).toLocaleString()+' h</b></div>':'')+
+        '<div class="rh-current" data-rh-total="'+esc(mc.key)+'">Total running hours added: <b>'+added.toLocaleString()+' h</b></div>'+
         '<div class="rh-jobs" data-rh-joblist="'+esc(mc.key)+'">'+jobLines+'</div>'+
       '</div>';
   }).join('');
   view.innerHTML =
     '<div class="section-title">⏱️ Running Hours</div>'+
-    '<p style="font-size:12.5px; color:var(--text-dim); margin:-6px 0 14px;">Enter each machine\'s current running-hours counter. The bars update live as you type; hours-based jobs become due automatically once their hours are reached, and then appear in Daily / Monthly views.</p>'+
+    '<p style="font-size:12.5px; color:var(--text-dim); margin:-6px 0 14px;">Enter how many <b>new hours</b> each machine has run since you last updated it. Those hours add to the total below, and every hours-based job advances by that much — becoming due automatically once it reaches its interval. Complete a due job here to reset just that job to zero.</p>'+
     '<div class="rh-list">'+rows+'</div>';
   attachRunningHoursHandlers(view, machines);
 }
 function attachRunningHoursHandlers(view, machines){
   const byKey = new Map(machines.map(m=>[m.key,m]));
+  function renderSavedJobs(mc){
+    const listEl = view.querySelector('.rh-jobs[data-rh-joblist="'+CSS.escape(mc.key)+'"]');
+    if(listEl) listEl.innerHTML = mc.jobs.slice().sort((a,b)=>(intervalHours(a.interval)||0)-(intervalHours(b.interval)||0)).map(rhJobLine).join('');
+    bindDoneButtons(mc);
+  }
+  function bindDoneButtons(mc){
+    const listEl = view.querySelector('.rh-jobs[data-rh-joblist="'+CSS.escape(mc.key)+'"]');
+    if(!listEl) return;
+    listEl.querySelectorAll('[data-rh-done]').forEach(btn=> btn.addEventListener('click', ()=>{
+      const id = Number(btn.dataset.rhDone);
+      completeJob(id, {location:'At Sea', doneDate:TODAY});
+      toast('Marked complete — hours reset');
+      renderRunningHours();
+    }));
+  }
+  machines.forEach(bindDoneButtons);
   view.querySelectorAll('.rh-input').forEach(input=>{
     const key = input.dataset.mkey;
     const preview = view.querySelector('.rh-preview[data-rh-preview="'+CSS.escape(key)+'"]');
-    // live preview as the user types
+    // live preview as the user types (input = NEW hours to add)
     input.addEventListener('input', ()=>{
       const mc = byKey.get(key); if(!mc) return;
       const listEl = view.querySelector('.rh-jobs[data-rh-joblist="'+CSS.escape(key)+'"]');
-      if(input.value===''){ if(preview) preview.style.display='none';
-        // restore saved rendering
-        if(listEl) listEl.innerHTML = mc.jobs.slice().sort((a,b)=>(intervalHours(a.interval)||0)-(intervalHours(b.interval)||0)).map(rhJobLine).join('');
-        return; }
-      const counter = Number(input.value);
-      if(isNaN(counter) || counter<0){ if(preview){ preview.style.display='block'; preview.style.color='var(--red)'; preview.textContent='Enter a valid number'; } return; }
+      if(input.value===''){ if(preview) preview.style.display='none'; renderSavedJobs(mc); return; }
+      const add = Number(input.value);
+      if(isNaN(add) || add<0){ if(preview){ preview.style.display='block'; preview.style.color='var(--red)'; preview.textContent='Enter a valid number'; } return; }
       let newlyDue=0;
-      // rebuild each job line with the previewed accumulator
       if(listEl){
         listEl.innerHTML = mc.jobs.slice().sort((a,b)=>(intervalHours(a.interval)||0)-(intervalHours(b.interval)||0)).map(j=>{
-          const iv=intervalHours(j.interval)||0; const acc=jobAccumHoursPreview(j, counter);
+          const iv=intervalHours(j.interval)||0; const acc=jobAccumHoursPreview(j, add);
           const wasDue=!!STATE.hoursDueDate[j.id]; const nowDue=acc>=iv && iv>0;
           if(nowDue && !wasDue) newlyDue++;
           const pct = iv? Math.min(100, Math.round(acc/iv*100)) : 0;
           const stateCls = nowDue? 'rh-due' : (pct>=80?'rh-soon':'');
           return '<div class="rh-job '+stateCls+'">'+
-              '<div class="rh-job-name">'+esc(j.item)+'</div>'+
-              '<div class="rh-job-meter"><div class="rh-meter-track"><div class="rh-meter-fill" style="width:'+pct+'%"></div></div>'+
-                '<span class="rh-job-num">'+acc.toLocaleString()+' / '+iv.toLocaleString()+' h</span></div>'+
-              (nowDue? '<span class="rh-badge">'+(wasDue?'DUE '+shortDateNoYear(STATE.hoursDueDate[j.id]):'BECOMES DUE')+'</span>' : '<span class="rh-remain">'+Math.max(0,iv-acc).toLocaleString()+' h left</span>')+
+              '<div class="rh-job-main">'+
+                '<div class="rh-job-name">'+esc(j.item)+'</div>'+
+                '<div class="rh-job-meter"><div class="rh-meter-track"><div class="rh-meter-fill" style="width:'+pct+'%"></div></div>'+
+                  '<span class="rh-job-num">'+acc.toLocaleString()+' / '+iv.toLocaleString()+' h</span></div>'+
+                (nowDue? '<span class="rh-badge">'+(wasDue?'DUE '+shortDateNoYear(STATE.hoursDueDate[j.id]):'BECOMES DUE')+'</span>' : '<span class="rh-remain">'+Math.max(0,iv-acc).toLocaleString()+' h left</span>')+
+              '</div>'+
             '</div>';
         }).join('');
       }
       if(preview){
+        const newTotal = machineAdded(key)+add;
         preview.style.display='block'; preview.style.color='var(--interval-hours)';
-        preview.innerHTML = 'Preview at <b>'+counter.toLocaleString()+' h</b>'+(newlyDue>0? ' · <span style="color:var(--amber)">'+newlyDue+' job'+(newlyDue===1?'':'s')+' will become due</span>':'')+' — tap Update to apply';
+        preview.innerHTML = 'After adding <b>'+add.toLocaleString()+' h</b> → total <b>'+newTotal.toLocaleString()+' h</b>'+(newlyDue>0? ' · <span style="color:var(--amber)">'+newlyDue+' job'+(newlyDue===1?'':'s')+' will become due</span>':'')+' — tap Add to apply';
       }
     });
   });
   view.querySelectorAll('.rh-save').forEach(btn=> btn.addEventListener('click', ()=>{
     const key=btn.dataset.mkey;
     const input=view.querySelector('.rh-input[data-mkey="'+CSS.escape(key)+'"]');
-    if(!input || input.value===''){ toast('Enter running hours'); return; }
+    if(!input || input.value===''){ toast('Enter hours to add'); return; }
+    const add = Number(input.value);
+    if(isNaN(add) || add<=0){ toast('Enter a valid number'); return; }
     const prevDue = Object.keys(STATE.hoursDueDate).length;
-    if(setMachineHours(key, input.value)){
-      const nowDue = Object.keys(STATE.hoursDueDate).length;
-      const newly = nowDue - prevDue;
-      toast(newly>0? newly+' job'+(newly===1?'':'s')+' now due' : 'Running hours updated');
+    if(addMachineHours(key, add)){
+      const newly = Object.keys(STATE.hoursDueDate).length - prevDue;
+      toast(newly>0? newly+' job'+(newly===1?'':'s')+' now due' : 'Added '+add.toLocaleString()+' h');
       renderRunningHours();
     } else { toast('Invalid hours'); }
   }));
@@ -1634,7 +1669,11 @@ function renderSettings(){
     const file=e.target.files[0]; if(!file) return; const reader=new FileReader();
     reader.onload=()=>{ try{ const imp=JSON.parse(reader.result); if(imp&&typeof imp==='object'){
       if(imp.statuses) STATE.statuses=imp.statuses; if(imp.jobMeta) STATE.jobMeta=imp.jobMeta; if(imp.jobDueOverride) STATE.jobDueOverride=imp.jobDueOverride; if(imp.permits) STATE.permits=imp.permits; if('signOffDate' in imp) STATE.signOffDate=imp.signOffDate; if(imp.theme) STATE.theme=imp.theme;
-      if(imp.machineHours) STATE.machineHours=imp.machineHours; if(imp.machineHoursBase) STATE.machineHoursBase=imp.machineHoursBase; if(imp.hoursJobBase) STATE.hoursJobBase=imp.hoursJobBase; if(imp.hoursDueDate) STATE.hoursDueDate=imp.hoursDueDate;
+      if(imp.machineHoursAdded) STATE.machineHoursAdded=imp.machineHoursAdded;
+      else if(imp.machineHours && imp.machineHoursBase){ // migrate old absolute-counter exports → added-hours model
+        const added={}; Object.keys(imp.machineHours).forEach(k=>{ const d=Number(imp.machineHours[k])-Number(imp.machineHoursBase[k]); if(!isNaN(d)&&d>0) added[k]=d; }); STATE.machineHoursAdded=added;
+      }
+      if(imp.hoursJobBase) STATE.hoursJobBase=imp.hoursJobBase; if(imp.hoursDueDate) STATE.hoursDueDate=imp.hoursDueDate;
       if(Array.isArray(imp.importantDates)) STATE.importantDates=imp.importantDates; if('soundOn' in imp) STATE.soundOn=imp.soundOn; if('vibrateOn' in imp) STATE.vibrateOn=imp.vibrateOn;
       recomputeHoursDue(); saveState(); toast('Progress imported'); renderNav(); renderCurrentView(); } else toast('Invalid file'); }catch(err){ toast('Could not read file'); } };
     reader.readAsText(file);

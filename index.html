@@ -377,16 +377,21 @@ svg.ring{transform:rotate(-90deg);}
 .rh-head{display:flex; justify-content:space-between; align-items:baseline; gap:8px; margin-bottom:10px;}
 .rh-mname{font-size:13.5px; font-weight:800; color:var(--text);}
 .rh-sys{font-size:11px; color:var(--text-faint); text-align:right;}
-.rh-input-row{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
-.rh-input-row label{font-size:11.5px; color:var(--text-dim); font-weight:600; flex:1 0 100%;}
+.rh-input-row{display:flex; flex-direction:column; align-items:stretch; gap:6px;}
+.rh-input-row label{font-size:11.5px; color:var(--text-dim); font-weight:600;}
+.rh-input-line{display:flex; align-items:center; gap:8px;}
 .rh-input{flex:1 1 120px; min-width:110px; padding:9px 11px; border-radius:10px; border:1px solid var(--border); background:var(--bg-panel); color:var(--text); font-size:14px; font-weight:700; font-family:var(--font-mono);}
 .rh-input:focus{outline:none; border-color:var(--accent);}
 .rh-input-row .btn{margin:0;}
 .rh-current{font-size:11px; color:var(--text-faint); margin-top:6px;}
 .rh-jobs{display:flex; flex-direction:column; gap:7px; margin-top:11px;}
-.rh-job{display:grid; grid-template-columns:1fr auto; grid-template-areas:"name badge" "meter badge"; gap:2px 8px; align-items:center; padding:8px 10px; border-radius:10px; background:var(--bg-panel); border:1px solid var(--border-soft);}
+.rh-job{display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; background:var(--bg-panel); border:1px solid var(--border-soft);}
+.rh-job-main{flex:1 1 auto; min-width:0; display:grid; grid-template-columns:1fr auto; grid-template-areas:"name badge" "meter badge"; gap:2px 8px; align-items:center;}
 .rh-job.rh-due{border-color:var(--interval-hours); background:color-mix(in srgb, var(--interval-hours) 12%, var(--bg-panel));}
 .rh-job.rh-soon{border-color:var(--amber);}
+.rh-done-btn{flex-shrink:0; align-self:stretch; padding:0 12px; border-radius:10px; border:none; background:var(--green); color:#fff; font-size:11.5px; font-weight:800; cursor:pointer; white-space:nowrap; transition:transform .12s ease, filter .15s ease;}
+.rh-done-btn:active{transform:scale(.94);}
+.rh-done-btn:hover{filter:brightness(1.08);}
 .rh-job-name{grid-area:name; font-size:12px; font-weight:700; color:var(--text);}
 .rh-job-meter{grid-area:meter; display:flex; align-items:center; gap:8px;}
 .rh-meter-track{flex:1 1 auto; height:5px; border-radius:3px; background:var(--border); overflow:hidden; min-width:60px;}
@@ -429,12 +434,16 @@ svg.ring{transform:rotate(-90deg);}
 .batch-list{display:flex; flex-direction:column; gap:8px; margin:12px 0; max-height:46vh; overflow-y:auto;}
 .batch-item{display:flex; align-items:center; gap:12px; padding:11px 13px; background:var(--bg-tile); border:1px solid var(--border-soft); border-radius:var(--radius-sm); cursor:pointer;}
 .batch-item.checked{border-color:var(--green); background:var(--green-soft);}
+.batch-item.applied{border-color:var(--green); background:var(--green); cursor:default; transition:background .3s ease, border-color .3s ease;}
+.batch-item.applied .bi-title, .batch-item.applied .bi-sub{color:#fff;}
 .batch-check{flex-shrink:0; width:22px; height:22px; border-radius:6px; border:2px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:14px; font-weight:800; color:transparent;}
 .batch-item.checked .batch-check{background:var(--green); border-color:var(--green); color:#fff;}
+.batch-item.applied .batch-check{background:#fff; border-color:#fff; color:var(--green);}
 .batch-info{flex:1; min-width:0;}
 .batch-info .bi-title{font-size:13px; font-weight:800; overflow-wrap:anywhere;}
 .batch-info .bi-sub{font-size:11px; color:var(--text-faint); margin-top:1px; overflow-wrap:anywhere;}
 .batch-info .bi-due{font-size:10.5px; font-family:var(--font-mono); color:var(--red); margin-top:2px;}
+.batch-info .bi-due.done{color:#fff;}
 .batch-note{font-size:12px; color:var(--text-dim); margin-bottom:2px;}
 
 .btn{padding:11px 16px; border-radius:12px; border:1px solid var(--border); background:var(--bg-tile); color:var(--text); font-size:13px; font-weight:700; cursor:pointer; transition:background .15s; display:inline-flex; align-items:center; gap:6px; margin:0 6px 6px 0;}

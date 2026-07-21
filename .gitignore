@@ -11,3 +11,6 @@ npm-debug.log*
 
 # Local scratch
 *.log
+
+# Vessel PMS data exports — kept local, never published
+*.csv
