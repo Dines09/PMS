@@ -23,7 +23,7 @@
   --crit:#ff9b42; --crit-soft:#3d2a12;
   --crit-card:#4a2f10; --crit-card-border:#ff9b42;
   --permit:#ffd24d; --permit-soft:#3a3212;
-  --interval-red:#ff7a7a; --interval-blue:#5fb0ff; --interval-grey:#9daac7;
+  --interval-red:#ff7a7a; --interval-blue:#5fb0ff; --interval-grey:#9daac7; --interval-hours:#66d9c0;
   --shadow:0 2px 8px rgba(0,0,0,.35), 0 1px 2px rgba(0,0,0,.3);
   --shadow-lg:0 12px 32px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
   --dock-shadow:0 8px 30px rgba(0,0,0,.55);
@@ -45,7 +45,7 @@
   --crit:#c25e00; --crit-soft:#fbe6d2;
   --crit-card:#ffedd6; --crit-card-border:#e08a2b;
   --permit:#b8790a; --permit-soft:#fdf1de;
-  --interval-red:#d81e1e; --interval-blue:#0e6fb8; --interval-grey:#7c8598;
+  --interval-red:#d81e1e; --interval-blue:#0e6fb8; --interval-grey:#7c8598; --interval-hours:#0f9c86;
   --shadow:0 1px 3px rgba(20,30,50,.08), 0 1px 2px rgba(20,30,50,.06);
   --shadow-lg:0 8px 24px rgba(20,30,50,.14), 0 2px 8px rgba(20,30,50,.08);
   --dock-shadow:0 8px 30px rgba(20,30,50,.18);
@@ -220,6 +220,7 @@ a{color:inherit;}
 .tag.interval-red{background:transparent; color:var(--interval-red); border:1px solid var(--interval-red);}
 .tag.interval-blue{background:transparent; color:var(--interval-blue); border:1px solid var(--interval-blue);}
 .tag.interval-grey{background:transparent; color:var(--interval-grey); border:1px solid var(--border);}
+.tag.interval-hours{background:transparent; color:var(--interval-hours); border:1px solid var(--interval-hours);}
 .tag.crit{background:var(--crit); color:#111;}
 .tag.overdue{background:var(--red); color:#fff;}
 .tag.weekly{background:var(--accent); color:#fff;}
@@ -369,6 +370,73 @@ svg.ring{transform:rotate(-90deg);}
 .settings-block{margin-bottom:16px;}
 .settings-block h4{font-size:14px; margin-bottom:8px; font-weight:800;}
 .settings-block p{font-size:12.5px; color:var(--text-dim); margin-bottom:10px;}
+
+/* Running-hours updater */
+.rh-list{display:flex; flex-direction:column; gap:12px;}
+.rh-machine{border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px; background:var(--bg-tile);}
+.rh-head{display:flex; justify-content:space-between; align-items:baseline; gap:8px; margin-bottom:10px;}
+.rh-mname{font-size:13.5px; font-weight:800; color:var(--text);}
+.rh-sys{font-size:11px; color:var(--text-faint); text-align:right;}
+.rh-input-row{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.rh-input-row label{font-size:11.5px; color:var(--text-dim); font-weight:600; flex:1 0 100%;}
+.rh-input{flex:1 1 120px; min-width:110px; padding:9px 11px; border-radius:10px; border:1px solid var(--border); background:var(--bg-panel); color:var(--text); font-size:14px; font-weight:700; font-family:var(--font-mono);}
+.rh-input:focus{outline:none; border-color:var(--accent);}
+.rh-input-row .btn{margin:0;}
+.rh-current{font-size:11px; color:var(--text-faint); margin-top:6px;}
+.rh-jobs{display:flex; flex-direction:column; gap:7px; margin-top:11px;}
+.rh-job{display:grid; grid-template-columns:1fr auto; grid-template-areas:"name badge" "meter badge"; gap:2px 8px; align-items:center; padding:8px 10px; border-radius:10px; background:var(--bg-panel); border:1px solid var(--border-soft);}
+.rh-job.rh-due{border-color:var(--interval-hours); background:color-mix(in srgb, var(--interval-hours) 12%, var(--bg-panel));}
+.rh-job.rh-soon{border-color:var(--amber);}
+.rh-job-name{grid-area:name; font-size:12px; font-weight:700; color:var(--text);}
+.rh-job-meter{grid-area:meter; display:flex; align-items:center; gap:8px;}
+.rh-meter-track{flex:1 1 auto; height:5px; border-radius:3px; background:var(--border); overflow:hidden; min-width:60px;}
+.rh-meter-fill{height:100%; background:var(--interval-hours); border-radius:3px; transition:width .3s ease;}
+.rh-job.rh-soon .rh-meter-fill{background:var(--amber);}
+.rh-job-num{font-size:10.5px; color:var(--text-faint); font-family:var(--font-mono); white-space:nowrap;}
+.rh-badge{grid-area:badge; font-size:10px; font-weight:800; color:#111; background:var(--interval-hours); padding:3px 8px; border-radius:20px; white-space:nowrap;}
+.rh-remain{grid-area:badge; font-size:10.5px; color:var(--text-faint); font-family:var(--font-mono); white-space:nowrap;}
+/* live-updating accumulated-hours readout under the input */
+.rh-preview{font-size:11.5px; color:var(--interval-hours); font-weight:700; margin-top:6px; font-family:var(--font-mono);}
+.rh-preview b{color:var(--text); font-size:13px;}
+
+/* ---------- Toggle switch (settings) ---------- */
+.toggle-row{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 0;}
+.toggle-row .tr-text{font-size:13px; font-weight:600; color:var(--text-dim);}
+.switch{position:relative; flex-shrink:0; width:46px; height:26px; border-radius:14px; background:var(--bg-tile); border:1px solid var(--border); cursor:pointer; transition:background .2s, border-color .2s;}
+.switch::after{content:""; position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%; background:var(--text-faint); transition:transform .2s, background .2s;}
+.switch.on{background:var(--accent-soft); border-color:var(--accent);}
+.switch.on::after{transform:translateX(20px); background:var(--accent);}
+
+/* ---------- Important Dates (Home) ---------- */
+.impdates-panel{background:var(--bg-panel); border:1px solid var(--border); border-radius:var(--radius); padding:16px 18px; margin-top:14px;}
+.impdates-head{display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px;}
+.impdates-head h3{font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-faint); font-weight:800; margin:0; display:flex; align-items:center; gap:7px;}
+.impdates-add{width:32px; height:32px; border-radius:10px; border:1px solid var(--accent); background:var(--accent-soft); color:var(--accent); font-size:18px; font-weight:800; cursor:pointer; display:flex; align-items:center; justify-content:center; line-height:1;}
+.impdate-item{display:flex; align-items:center; gap:12px; padding:11px 12px; background:var(--bg-tile); border:1px solid var(--border-soft); border-radius:var(--radius-sm); margin-bottom:8px;}
+.impdate-pill{flex-shrink:0; display:flex; flex-direction:column; align-items:center; justify-content:center; min-width:52px; height:50px; border-radius:12px; background:var(--accent-soft); color:var(--accent); font-family:var(--font-mono); font-weight:800; line-height:1.05;}
+.impdate-pill .id-day{font-size:18px;} .impdate-pill .id-mon{font-size:10px; text-transform:uppercase; letter-spacing:.4px;} .impdate-pill .id-yr{font-size:8.5px; color:var(--text-faint);}
+.impdate-body{flex:1; min-width:0;}
+.impdate-body .id-text{font-size:13.5px; font-weight:700; overflow-wrap:anywhere;}
+.impdate-body .id-rel{font-size:11px; color:var(--text-faint); margin-top:2px;}
+.impdate-del{flex-shrink:0; width:30px; height:30px; border-radius:50%; border:1px solid var(--border); background:var(--bg-panel); color:var(--text-faint); cursor:pointer; font-size:15px; display:flex; align-items:center; justify-content:center;}
+.impdate-del:hover{color:var(--red); border-color:var(--red); background:var(--red-soft);}
+.impdates-empty{font-size:12.5px; color:var(--text-faint); padding:10px 4px;}
+.impdate-form{display:flex; flex-direction:column; gap:10px;}
+.impdate-form input[type=text], .impdate-form input[type=date]{width:100%; padding:11px 13px; border-radius:12px; border:1px solid var(--border); background:var(--bg-tile); color:var(--text); font-size:14px; font-family:inherit;}
+.impdate-form input:focus{outline:none; border-color:var(--accent);}
+
+/* ---------- Batch same-day update sheet ---------- */
+.batch-list{display:flex; flex-direction:column; gap:8px; margin:12px 0; max-height:46vh; overflow-y:auto;}
+.batch-item{display:flex; align-items:center; gap:12px; padding:11px 13px; background:var(--bg-tile); border:1px solid var(--border-soft); border-radius:var(--radius-sm); cursor:pointer;}
+.batch-item.checked{border-color:var(--green); background:var(--green-soft);}
+.batch-check{flex-shrink:0; width:22px; height:22px; border-radius:6px; border:2px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:14px; font-weight:800; color:transparent;}
+.batch-item.checked .batch-check{background:var(--green); border-color:var(--green); color:#fff;}
+.batch-info{flex:1; min-width:0;}
+.batch-info .bi-title{font-size:13px; font-weight:800; overflow-wrap:anywhere;}
+.batch-info .bi-sub{font-size:11px; color:var(--text-faint); margin-top:1px; overflow-wrap:anywhere;}
+.batch-info .bi-due{font-size:10.5px; font-family:var(--font-mono); color:var(--red); margin-top:2px;}
+.batch-note{font-size:12px; color:var(--text-dim); margin-bottom:2px;}
+
 .btn{padding:11px 16px; border-radius:12px; border:1px solid var(--border); background:var(--bg-tile); color:var(--text); font-size:13px; font-weight:700; cursor:pointer; transition:background .15s; display:inline-flex; align-items:center; gap:6px; margin:0 6px 6px 0;}
 .btn:hover{background:var(--bg-tile-hover);}
 .btn.primary{background:var(--accent); border-color:var(--accent); color:#fff;}
@@ -436,11 +504,14 @@ input[type=file]{display:none;}
   transition:transform .32s cubic-bezier(.34,1.2,.5,1), width .32s cubic-bezier(.34,1.2,.5,1);
 }
 .bottom-bar .nav-item{
-  position:relative; z-index:1; flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px;
+  position:relative; z-index:1; flex:1 1 0; min-width:0; text-align:center;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px;
   padding:7px 4px; border-radius:16px; cursor:pointer; color:var(--text-faint);
   font-size:11px; font-weight:700; transition:color .2s ease; border:none; background:none;
 }
-.bottom-bar .nav-item .ni-icon{font-size:21px; line-height:1;}
+/* keep the icon + label glyphs optically centered inside each equal-width slot */
+.bottom-bar .nav-item .ni-icon{font-size:21px; line-height:1; display:block; width:100%; text-align:center;}
+.bottom-bar .nav-item span:not(.ni-icon){display:block; width:100%; text-align:center;}
 .bottom-bar .nav-item.active{color:var(--accent);}
 
 /* Desktop top tab bar */
@@ -565,6 +636,7 @@ button:focus-visible, .chip:focus-visible, .nav-item:focus-visible, .month-rect:
     <div class="view" id="view-postponed"></div>
     <div class="view" id="view-focus"></div>
     <div class="view" id="view-machines"></div>
+    <div class="view" id="view-runninghours"></div>
     <div class="view" id="view-search"></div>
     <div class="view" id="view-settings"></div>
   </div>

@@ -6,6 +6,9 @@
 (function(){
 "use strict";
 
+/* ---------- App version ---------- */
+const APP_VERSION = '1.1.0';
+
 /* ---------- Storage keys ---------- */
 const IMPORTED_JOBS_KEY = 'pms_dashboard_imported_jobs_v3';
 const META_KEY = 'pms_dashboard_import_meta_v3';
@@ -37,6 +40,13 @@ STATE.jobMeta       = STATE.jobMeta       || {};
 STATE.jobDueOverride= STATE.jobDueOverride|| {};
 STATE.permits       = STATE.permits       || {};
 STATE.lastDone      = STATE.lastDone      || {};   // id -> most recent done date (for machine view)
+STATE.machineHours  = STATE.machineHours  || {};   // machineKey -> current running hours (user-updated)
+STATE.machineHoursBase = STATE.machineHoursBase || {}; // machineKey -> hours reading when first set (baseline)
+STATE.hoursJobBase  = STATE.hoursJobBase  || {};   // id -> job's accumulated hrs at that baseline (for cycle reset)
+STATE.hoursDueDate  = STATE.hoursDueDate  || {};   // id -> ISO date the hours-job first crossed its interval (its due date)
+STATE.importantDates= STATE.importantDates|| [];   // [{id, date:ISO, text}] user-added reminders (Home)
+if(STATE.soundOn   ===undefined) STATE.soundOn   = true;   // tap sound on nav switch (default ON)
+if(STATE.vibrateOn ===undefined) STATE.vibrateOn = true;   // haptic vibration on nav switch (default ON)
 
 /* ============================================================
    DATE HELPERS
@@ -78,8 +88,11 @@ function addMonthsISO(iso, months){
 function parseInterval(intervalStr){
   const m = String(intervalStr||'').trim().toUpperCase().match(/^(\d+)\s*([A-Za-z]+)/);
   if(!m) return { n:null, unit:null };
-  return { n:Number(m[1]), unit:m[2][0] }; // unit: M / W / Y / D
+  return { n:Number(m[1]), unit:m[2][0] }; // unit: M / W / Y / D / H
 }
+/* Running-hours job = interval measured in hours (e.g. "2000 H"). */
+function isHoursJob(job){ return parseInterval(job&&job.interval).unit==='H'; }
+function intervalHours(intervalStr){ const {n,unit}=parseInterval(intervalStr); return unit==='H'?n:null; }
 function isWeekly(job){
   const {n,unit} = parseInterval(job.interval);
   if(unit==='W') return true;
@@ -90,6 +103,7 @@ function isWeekly(job){
 function intervalLabel(intervalStr){
   const {n,unit} = parseInterval(intervalStr);
   if(n==null) return intervalStr||'';
+  if(unit==='H'){ return n.toLocaleString()+' Hrs'; }
   if(unit==='W'){ return n===1?'Weekly':n+' Weekly'; }
   if(unit==='D'){ if(n===1) return 'Daily'; if(n===7) return 'Weekly'; return n+' Daily'; }
   if(unit==='Y'){ return n===1?'Yearly':n+' Yearly'; }
@@ -115,6 +129,7 @@ function intervalMonths(intervalStr){
 function intervalColorClass(intervalStr){
   const {n,unit} = parseInterval(intervalStr);
   if(n==null) return 'interval-grey';
+  if(unit==='H') return 'interval-hours';           // running-hours = distinct colour
   const months = intervalMonths(intervalStr);
   if(unit==='M' && n===3) return 'interval-blue';   // 3-monthly = blue
   if(months >= 6) return 'interval-red';            // 6-monthly and longer = red
@@ -138,8 +153,15 @@ function normDate(raw){
   if(!raw) return '';
   raw = String(raw).trim();
   if(/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-  const m = raw.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
-  if(m){ const mi=MON.findIndex(x=>x.slice(0,3).toLowerCase()===m[2].toLowerCase()); if(mi>=0) return m[3]+'-'+String(mi+1).padStart(2,'0')+'-'+String(Number(m[1])).padStart(2,'0'); }
+  // DD-Mon-YY or DD-Mon-YYYY (PMS exports use 2-digit years, e.g. 11-Jul-26)
+  const m = raw.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2}|\d{4})$/);
+  if(m){
+    const mi=MON.findIndex(x=>x.slice(0,3).toLowerCase()===m[2].toLowerCase());
+    if(mi>=0){
+      let yr=Number(m[3]); if(m[3].length===2) yr += yr<70 ? 2000 : 1900;   // 26 -> 2026
+      return yr+'-'+String(mi+1).padStart(2,'0')+'-'+String(Number(m[1])).padStart(2,'0');
+    }
+  }
   return raw;
 }
 function splitCsvLine(line){
@@ -160,13 +182,14 @@ function parseCsvToJobs(text){
     if(!company){ company=f[0]; vessel=f[2]; reportDate=normDate(f[4]); }
     const groupFull=f[14]||''; if(!groupFull) return;
     const item=f[17]||''; if(!item) return;
-    const work=f[18]||''; const done=normDate(f[21]||''); const due=normDate(f[22]||'');
+    const work=f[18]||''; const hrsRunRaw=f[20]||''; const done=normDate(f[21]||''); const due=normDate(f[22]||'');
     const interval=(f[23]||'').replace(/"/g,'').trim(); const dept=f[24]||''; const critFlag=f[16]||'';
     let system=groupFull,machine=groupFull; const dash=groupFull.indexOf(' - ');
     if(dash>=0){ system=groupFull.slice(0,dash).trim(); machine=groupFull.slice(dash+3).trim(); }
+    const hrsRun = hrsRunRaw!=='' && !isNaN(Number(hrsRunRaw)) ? Number(hrsRunRaw) : null;
     jobs.push({ id:autoId++, system:toTitleCase(system), machine:toTitleCase(machine),
       group_full:toTitleCase(system)+' - '+toTitleCase(machine), item:toTitleCase(item),
-      work, done, due, interval, dept,
+      work, done, due, interval, dept, hrsRun,
       critical:/^(y|yes|c|crit|critical|\*)$/i.test(String(critFlag).trim()) });
   });
   return { jobs, vessel, company, reportDate };
@@ -183,12 +206,75 @@ function importAnyFormat(text){
 }
 
 /* ============================================================
+   RUNNING-HOURS ENGINE
+   Some jobs are due by machine running-hours (interval like "2000 H"), not by
+   calendar date. The user updates each machine's current running hours in
+   Settings. A job's accumulated hours = its hrs-run at import + how far the
+   machine counter has advanced since the user first entered a reading for it.
+   When accumulated >= interval, the job becomes due (dated the day it crossed).
+   ============================================================ */
+function machineKey(job){ return job.group_full; }
+/* machines that actually carry running-hours jobs (for the Settings updater) */
+function hoursMachines(){
+  const map = new Map();   // key -> {system, machine, key, jobs:[], maxInterval}
+  RAW.forEach(j=>{
+    if(!isHoursJob(j)) return;
+    const k = machineKey(j);
+    if(!map.has(k)) map.set(k, {key:k, system:j.system, machine:j.machine, jobs:[], maxInterval:0});
+    const e = map.get(k); e.jobs.push(j);
+    e.maxInterval = Math.max(e.maxInterval, intervalHours(j.interval)||0);
+  });
+  return Array.from(map.values()).sort((a,b)=> a.machine.localeCompare(b.machine));
+}
+/* how far a machine's counter has advanced since the user first set it */
+function machineDelta(key){
+  const cur = STATE.machineHours[key];
+  const base = STATE.machineHoursBase[key];
+  if(cur==null || base==null) return 0;
+  return Math.max(0, cur - base);
+}
+/* a running-hours job's current accumulated hours toward its interval */
+function jobAccumHours(job){
+  const baseAcc = (STATE.hoursJobBase[job.id]!=null) ? STATE.hoursJobBase[job.id]
+                : (job.hrsRun!=null ? job.hrsRun : 0);
+  return baseAcc + machineDelta(machineKey(job));
+}
+/* recompute due-dates for hours jobs after a machine's hours change.
+   Sets STATE.hoursDueDate[id] = TODAY the first time a job crosses its interval;
+   clears it if the job falls back below (e.g. baseline corrected). */
+function recomputeHoursDue(){
+  let changed=false;
+  RAW.forEach(j=>{
+    if(!isHoursJob(j)) return;
+    const iv = intervalHours(j.interval); if(!iv) return;
+    const due = jobAccumHours(j) >= iv;
+    if(due && !STATE.hoursDueDate[j.id]){ STATE.hoursDueDate[j.id]=TODAY; changed=true; }
+    else if(!due && STATE.hoursDueDate[j.id]){ delete STATE.hoursDueDate[j.id]; changed=true; }
+  });
+  if(changed) saveState();
+}
+/* set a machine's current running hours (first call establishes the baseline) */
+function setMachineHours(key, hours){
+  hours = Number(hours);
+  if(isNaN(hours) || hours<0) return false;
+  if(STATE.machineHoursBase[key]==null) STATE.machineHoursBase[key]=hours;   // baseline = first reading
+  STATE.machineHours[key]=hours;
+  saveState();
+  recomputeHoursDue();
+  return true;
+}
+
+/* ============================================================
    JOB STATUS  (per-occurrence: keyed by id@dueDate)
    A status attaches to the specific occurrence (id + its due date at the
    time of marking). When a job is completed its next-due is recalculated;
    that new occurrence has a different key, so it shows as pending again.
    ============================================================ */
-function getJobDue(job){ return STATE.jobDueOverride[job.id] || job.due; }
+function getJobDue(job){
+  if(STATE.jobDueOverride[job.id]) return STATE.jobDueOverride[job.id];
+  if(isHoursJob(job)) return STATE.hoursDueDate[job.id] || '';   // '' => not yet due (kept out of calendar views)
+  return job.due;
+}
 function statusKey(job){ return job.id + '@' + getJobDue(job); }
 function getStatus(job){
   // accept a job object; (legacy id fallback not used)
@@ -196,9 +282,12 @@ function getStatus(job){
 }
 function setStatusForKey(key, status){ if(status===null) delete STATE.statuses[key]; else STATE.statuses[key]=status; saveState(); }
 function setStatus(job, status){ setStatusForKey(statusKey(job), status); }
-function isOverdue(job){ return getJobDue(job) < TODAY && getStatus(job)!=='done'; }
+function isOverdue(job){ const d=getJobDue(job); return d && d < TODAY && getStatus(job)!=='done'; }
 function withinSignOff(job){ if(!STATE.signOffDate) return true; return getJobDue(job) <= STATE.signOffDate; }
-function visibleJobs(){ return RAW.filter(withinSignOff); }
+/* A running-hours job with no due date yet ('') is not scheduled anywhere on the
+   calendar — exclude it from the general job pool (still reachable in Machines). */
+function isScheduled(job){ return !(isHoursJob(job) && !getJobDue(job)); }
+function visibleJobs(){ return RAW.filter(j=> isScheduled(j) && withinSignOff(j)); }
 
 /* Occurrences a job appears on:
    - the live occurrence (override||due), pending unless acted on
@@ -206,6 +295,7 @@ function visibleJobs(){ return RAW.filter(withinSignOff); }
      the original due keeps its completed/postponed occurrence too. */
 function occurrencesOf(job){
   const live = getJobDue(job);
+  if(!live) return [];   // hours-job not yet due => no calendar occurrence
   const arr = [{ date: live, status: STATE.statuses[job.id+'@'+live]||null }];
   const override = STATE.jobDueOverride[job.id];
   if(override && override!==job.due){
@@ -230,6 +320,29 @@ function isFocusJob(j){
   const hay = (j.machine+' '+j.item+' '+j.group_full).toLowerCase();
   return hay.includes('motor starter') || hay.includes('breaker routine') ||
          hay.includes('motor overhaul') || hay.includes('starter routine');
+}
+/* Medical jobs (medicine chest, hospital, medical locker, etc.) — surfaced first in Daily. */
+function isMedicalJob(j){
+  const hay = (j.system+' '+j.machine+' '+j.item+' '+j.group_full+' '+(j.dept||'')).toLowerCase();
+  return hay.includes('medical') || hay.includes('medicine') || hay.includes('hospital');
+}
+/* Daily-view ordering tier (lower = higher up the list):
+   0 Medical · 1 Motor Starters (PTW-06) · 2..N interval DESC (yearly→…→monthly) · last Weekly.
+   Weekly is forced to the very bottom; everything else ranks by interval length descending. */
+function dailyTier(j){
+  if(isMedicalJob(j)) return 0;
+  if(isFocusJob(j))   return 1;
+  if(isWeekly(j))     return 9999;                 // weekly always last
+  // interval-length band: bigger interval → smaller tier number (higher up)
+  const months = intervalMonths(j.interval);       // yearly=12, 6M=6, 3M=3, monthly=1…
+  return 100 - Math.min(96, months);               // 12→88, 6→94, 3→97, 1→99 (all < weekly's 9999)
+}
+function dailySortKey(a,b){
+  const ta=dailyTier(a), tb=dailyTier(b);
+  if(ta!==tb) return ta-tb;
+  // within a tier: critical first, then by due date
+  if((b.critical?1:0)!==(a.critical?1:0)) return (b.critical?1:0)-(a.critical?1:0);
+  return getJobDue(a).localeCompare(getJobDue(b));
 }
 function createPermitForJob(job, doneISO){
   const pid='P'+job.id;
@@ -263,12 +376,13 @@ const TABS = [
   {id:'postponed',label:'Postponed',icon:'⏸️'},
   {id:'focus',    label:'Motor Starters', icon:'⚙️'},
   {id:'machines', label:'Machines',icon:'🔧'},
+  {id:'runninghours', label:'Running Hours', icon:'⏱️'},
   {id:'search',   label:'Search',  icon:'🔍'},
   {id:'settings', label:'Settings',icon:'⚙'},
 ];
 const BOTTOM_TABS = ['home','daily','month','settings'];
-/* chip order requested: search, machines, critical, done, postponed, motor starters, weekly */
-const CHIP_TABS   = ['search','machines','critical','done','postponed','focus','weekly'];
+/* chip order requested: machines, running hours, critical, done, postponed, motor starters, weekly */
+const CHIP_TABS   = ['machines','runninghours','critical','done','postponed','focus','weekly'];
 
 /* ---------- Navigation state (drill-downs) ---------- */
 const nav = {
@@ -331,8 +445,12 @@ function moveNavSlider(){
   if(!slider) return;
   const active = bar.querySelector('.nav-item.active');
   if(active){
-    slider.style.width = active.offsetWidth+'px';
-    slider.style.transform = 'translateX('+ (active.offsetLeft - 7) +'px)';
+    // The slider (left:0) sits at the bar's padding edge; nav-item.offsetLeft is
+    // measured from the bar's border edge — so subtract the bar's left padding to
+    // land the pill perfectly centered over each equal-width slot.
+    const padL = parseFloat(getComputedStyle(bar).paddingLeft) || 0;
+    slider.style.width = Math.round(active.getBoundingClientRect().width)+'px';
+    slider.style.transform = 'translateX('+ Math.round(active.offsetLeft - padL) +'px)';
     slider.style.opacity = '1';
   } else {
     slider.style.opacity = '0';
@@ -352,7 +470,7 @@ function renderNav(){
     const t=TABS.find(x=>x.id===id);
     return '<button class="nav-item '+(id===nav.tab?'active':'')+'" data-tab="'+id+'"><span class="ni-icon">'+t.icon+'</span><span>'+t.label+'</span></button>';
   }).join('');
-  bb.querySelectorAll('.nav-item').forEach(b=> b.addEventListener('click', ()=>switchTab(b.dataset.tab)));
+  bb.querySelectorAll('.nav-item').forEach(b=> b.addEventListener('click', ()=>{ navFeedback(); switchTab(b.dataset.tab); }));
 
   const cr = document.getElementById('chipRow');
   cr.innerHTML = CHIP_TABS.map(id=>{
@@ -360,7 +478,7 @@ function renderNav(){
     const badge = id==='focus' ? '<span class="chip-badge" data-focus-badge style="display:none;">0</span>' : '';
     return '<button class="chip '+(id===nav.tab?'active':'')+'" data-tab="'+id+'"><span class="c-icon">'+t.icon+'</span><span>'+t.label+'</span>'+badge+'</button>';
   }).join('');
-  cr.querySelectorAll('.chip').forEach(b=> b.addEventListener('click', ()=>{ switchTab(b.dataset.tab); collapseChips(); }));
+  cr.querySelectorAll('.chip').forEach(b=> b.addEventListener('click', ()=>{ navFeedback(); switchTab(b.dataset.tab); collapseChips(); }));
   updatePermitBell();
   requestAnimationFrame(moveNavSlider);
 }
@@ -381,6 +499,7 @@ function renderCurrentView(){
     case 'postponed': renderStatusList('postponed'); break;
     case 'focus': renderFocus(); break;
     case 'machines': renderMachines(); break;
+    case 'runninghours': renderRunningHours(); break;
     case 'search': renderSearch(); break;
     case 'settings': renderSettings(); break;
   }
@@ -490,8 +609,15 @@ function completeJob(id, opts){
   STATE.lastDone = STATE.lastDone || {};
   STATE.lastDone[id] = doneDate;
   // 2) advance the cycle → next due becomes a fresh (pending) occurrence
-  const months = intervalToMonths(job.interval);
-  if(months) STATE.jobDueOverride[id] = addMonthsISO(doneDate, months);
+  if(isHoursJob(job)){
+    // reset accumulated hours to 0 relative to the machine's current reading,
+    // and clear the due date so it drops off the calendar until it crosses again
+    STATE.hoursJobBase[id] = -machineDelta(machineKey(job));
+    delete STATE.hoursDueDate[id];
+  } else {
+    const months = intervalToMonths(job.interval);
+    if(months) STATE.jobDueOverride[id] = addMonthsISO(doneDate, months);
+  }
   if(isFocusJob(job)) createPermitForJob(job, doneDate);
   saveState();
 }
@@ -525,7 +651,8 @@ function clearJob(id, occDate){
   setStatusForKey(key, null);
   delete STATE.jobMeta[key];
   // if we undid a completion, roll the cycle back
-  if(wasDone){ delete STATE.jobDueOverride[id]; if(STATE.lastDone) delete STATE.lastDone[id]; const pid='P'+id; if(STATE.permits[pid]) delete STATE.permits[pid]; }
+  if(wasDone){ delete STATE.jobDueOverride[id]; if(STATE.lastDone) delete STATE.lastDone[id]; const pid='P'+id; if(STATE.permits[pid]) delete STATE.permits[pid];
+    if(isHoursJob(job)){ delete STATE.hoursJobBase[id]; recomputeHoursDue(); } }
   saveState(); toast('Status cleared'); refreshAll();
 }
 function refreshAll(){ updatePermitBell(); renderCurrentView(); }
@@ -665,6 +792,64 @@ function openCompletePopup(jobId){
     const doneDate = y+'-'+String(m).padStart(2,'0')+'-'+String(Math.min(d,lastDay)).padStart(2,'0');
     completeJob(jobId, {location:loc, doneDate});
     closePopover(); toast('Marked complete'); refreshAll();
+    // offer to apply the same done date to due sibling jobs on this machine
+    maybeOfferBatchSameDay(jobId, doneDate, loc);
+  });
+}
+
+/* ============================================================
+   BATCH SAME-DAY UPDATE
+   After completing one job, sibling jobs on the SAME machine (same group_full)
+   that are ALSO due (due on-or-before the done date) and still pending get
+   offered the same done date. All ticked by default; user can untick any.
+   ============================================================ */
+function batchSiblings(sourceId, doneDate){
+  const src = RAW.find(j=>j.id===sourceId); if(!src) return [];
+  return RAW.filter(j=>{
+    if(j.id===sourceId) return false;
+    if(j.group_full!==src.group_full) return false;   // same machine sub-group only
+    if(!isScheduled(j)) return false;                  // hours-jobs not yet due are skipped
+    if(getStatus(j)==='done') return false;            // already done this cycle
+    const due = getJobDue(j);
+    if(!due) return false;
+    return due <= doneDate;                             // also due on-or-before the completion date
+  });
+}
+function maybeOfferBatchSameDay(sourceId, doneDate, location){
+  const sibs = batchSiblings(sourceId, doneDate);
+  if(!sibs.length) return;
+  const src = RAW.find(j=>j.id===sourceId);
+  const root = document.getElementById('popoverRoot');
+  const rows = sortJobs(sibs).map(j=>{
+    const due=getJobDue(j);
+    return '<div class="batch-item checked" data-bid="'+j.id+'">'+
+        '<div class="batch-check">✓</div>'+
+        '<div class="batch-info">'+
+          '<div class="bi-title">'+esc(j.item)+(j.critical?' <span class="tag crit" style="vertical-align:middle;">Critical</span>':'')+'</div>'+
+          '<div class="bi-sub">Work — '+esc(displayWork(j))+'</div>'+
+          '<div class="bi-due">Due '+shortDate(due)+(due<TODAY?' · overdue':'')+'</div>'+
+        '</div>'+
+      '</div>';
+  }).join('');
+  root.innerHTML =
+    '<div class="sheet-overlay" id="batchOverlay"></div>'+
+    '<div class="complete-sheet" id="batchSheet">'+
+      '<div class="cs-grip"></div>'+
+      '<div class="cs-title">Also done on '+shortDate(doneDate)+'?</div>'+
+      '<div class="batch-note">These jobs on <b>'+esc(src.machine)+'</b> are also due. Untick any you didn\'t do. Ticked jobs will be marked complete on <b>'+shortDate(doneDate)+'</b>.</div>'+
+      '<div class="batch-list" id="batchList">'+rows+'</div>'+
+      '<div class="cs-actions"><button class="btn" id="batchSkip">Skip</button><button class="btn primary" id="batchApply">Apply to selected</button></div>'+
+    '</div>';
+  const close=()=>{ root.innerHTML=''; };
+  document.getElementById('batchOverlay').addEventListener('click', close);
+  document.getElementById('batchSkip').addEventListener('click', close);
+  root.querySelectorAll('.batch-item').forEach(it=> it.addEventListener('click', ()=> it.classList.toggle('checked')));
+  document.getElementById('batchApply').addEventListener('click', ()=>{
+    const ids = Array.from(root.querySelectorAll('.batch-item.checked')).map(el=>Number(el.dataset.bid));
+    ids.forEach(id=> completeJob(id, {location, doneDate}));
+    close();
+    if(ids.length) toast(ids.length+' more marked complete');
+    refreshAll();
   });
 }
 /* wheel: snap-scroll; the centered item is the selected value */
@@ -782,6 +967,7 @@ function renderHome(){
       '<div class="stat-card postponed" data-counter="postponed"><div class="num">'+s.postponed+'</div><div class="label">Postponed</div></div>'+
       '<div class="stat-card motor" data-counter="motor"><div class="num">'+s.motor+'</div><div class="label">Motor Starters</div></div>'+
     '</div>'+
+    importantDatesPanel()+
     (permits.length?
       '<div class="home-panel" style="margin-top:14px; border-color:var(--permit);"><h3 style="color:var(--permit);">📋 PTW-06 Permits Pending — '+permits.length+'</h3>'+permits.slice(0,4).map(permitRow).join('')+(permits.length>4?'<button class="btn" id="homeMorePermits" style="margin-top:6px;">View all '+permits.length+' permits</button>':'')+'</div>':'')+
     '<div class="home-grid" style="margin-top:14px;">'+
@@ -813,6 +999,76 @@ function renderHome(){
   document.querySelectorAll('[data-goto-daily-crit]').forEach(el=> el.addEventListener('click', ()=> go(()=>{ nav.date=el.dataset.gotoDailyCrit; nav.tab='daily'; })));
   const mp=document.getElementById('homeMorePermits'); if(mp) mp.addEventListener('click', openPermitModal);
   attachPermitActions(document.getElementById('view-home'));
+  attachImportantDatesHandlers();
+}
+
+/* ============================================================
+   IMPORTANT DATES  (Home panel — user-added dated reminders)
+   Sorted most-recent-first (descending). Each = {id, date:ISO, text}.
+   ============================================================ */
+function sortedImportantDates(){
+  return (STATE.importantDates||[]).slice().sort((a,b)=> b.date.localeCompare(a.date) || (b.id-a.id));
+}
+function relDateLabel(iso){
+  const diff = daysBetween(TODAY, iso);
+  if(diff===0) return 'Today';
+  if(diff===1) return 'Tomorrow';
+  if(diff===-1) return 'Yesterday';
+  if(diff>1) return 'in '+diff+' days';
+  return Math.abs(diff)+' days ago';
+}
+function importantDatesPanel(){
+  const items = sortedImportantDates();
+  const rows = items.length
+    ? items.map(it=>{ const p=duePillParts(it.date); const yr=parseISO(it.date).getFullYear();
+        return '<div class="impdate-item" data-impid="'+it.id+'">'+
+            '<div class="impdate-pill"><span class="id-day">'+p.day+'</span><span class="id-mon">'+p.mon+'</span><span class="id-yr">'+yr+'</span></div>'+
+            '<div class="impdate-body"><div class="id-text">'+esc(it.text)+'</div><div class="id-rel">'+relDateLabel(it.date)+'</div></div>'+
+            '<button class="impdate-del" data-impdel="'+it.id+'" title="Delete">✕</button>'+
+          '</div>';
+      }).join('')
+    : '<div class="impdates-empty">No important dates yet. Tap + to add an inspection, test, or any date you want to remember.</div>';
+  return '<div class="impdates-panel">'+
+      '<div class="impdates-head"><h3>📌 Important Dates</h3><button class="impdates-add" id="impdateAddBtn" title="Add important date">+</button></div>'+
+      rows+
+    '</div>';
+}
+function attachImportantDatesHandlers(){
+  const add=document.getElementById('impdateAddBtn'); if(add) add.addEventListener('click', openImportantDateForm);
+  document.querySelectorAll('[data-impdel]').forEach(btn=> btn.addEventListener('click', ()=>{
+    const id=Number(btn.dataset.impdel);
+    STATE.importantDates = (STATE.importantDates||[]).filter(x=>x.id!==id);
+    saveState(); toast('Removed'); renderHome();
+  }));
+}
+function openImportantDateForm(){
+  const root=document.getElementById('popoverRoot');
+  root.innerHTML =
+    '<div class="sheet-overlay" id="impOverlay"></div>'+
+    '<div class="complete-sheet" id="impSheet">'+
+      '<div class="cs-grip"></div>'+
+      '<div class="cs-title">📌 Add Important Date</div>'+
+      '<div class="impdate-form">'+
+        '<div><div class="cs-sub" style="margin-top:0;">What is it?</div>'+
+          '<input type="text" id="impText" maxlength="120" placeholder="e.g. Annual survey, PSC inspection, Lifeboat drill" autocomplete="off"></div>'+
+        '<div><div class="cs-sub">Date</div>'+
+          '<input type="date" id="impDate" value="'+TODAY+'"></div>'+
+      '</div>'+
+      '<div class="cs-actions"><button class="btn" id="impCancel">Cancel</button><button class="btn primary" id="impSave">Save</button></div>'+
+    '</div>';
+  const close=()=>{ root.innerHTML=''; };
+  document.getElementById('impOverlay').addEventListener('click', close);
+  document.getElementById('impCancel').addEventListener('click', close);
+  setTimeout(()=>{ const t=document.getElementById('impText'); if(t) t.focus(); }, 50);
+  document.getElementById('impSave').addEventListener('click', ()=>{
+    const text=(document.getElementById('impText').value||'').trim();
+    const date=document.getElementById('impDate').value||'';
+    if(!text){ toast('Enter a description'); return; }
+    if(!date){ toast('Pick a date'); return; }
+    STATE.importantDates = STATE.importantDates||[];
+    STATE.importantDates.push({ id:Date.now(), date, text });
+    saveState(); close(); toast('Important date added'); renderHome();
+  });
 }
 
 function openCounterList(kind){
@@ -851,7 +1107,7 @@ function safetyBannerHtml(){
 }
 function renderDaily(){
   let occs = occurrencesOnDate(nav.date);
-  occs.sort((a,b)=> jobSortKey(a.job,b.job));
+  occs.sort((a,b)=> dailySortKey(a.job,b.job));
   const done = occs.filter(o=>o.status==='done').length;
   const pct = occs.length? Math.round(done/occs.length*100):0;
   const isToday = nav.date===TODAY;
@@ -954,7 +1210,8 @@ function renderStatusList(kind){
     setStatusForKey(key, null); delete STATE.jobMeta[key];
     // if this was the done occurrence that advanced the cycle, roll back the override
     const job=RAW.find(j=>j.id===id);
-    if(job && kind==='done'){ delete STATE.jobDueOverride[id]; if(STATE.lastDone) delete STATE.lastDone[id]; }
+    if(job && kind==='done'){ delete STATE.jobDueOverride[id]; if(STATE.lastDone) delete STATE.lastDone[id];
+      if(isHoursJob(job)){ delete STATE.hoursJobBase[id]; recomputeHoursDue(); } }
     saveState(); toast('Status cleared'); updatePermitBell(); renderCurrentView();
   }));
 }
@@ -1008,7 +1265,7 @@ function openDayModal(iso){
 
 /* We implement day view as a modal but tie it to history via a lightweight flag. */
 function showDayModalNow(iso){
-  const occs = occurrencesOnDate(iso).sort((a,b)=> jobSortKey(a.job,b.job));
+  const occs = occurrencesOnDate(iso).sort((a,b)=> dailySortKey(a.job,b.job));
   const root=document.getElementById('modalRoot');
   root.innerHTML =
     '<div class="modal-overlay" id="dayOverlay"><div class="modal-sheet" onclick="event.stopPropagation()">'+
@@ -1123,6 +1380,122 @@ function renderMachineDetail(system,machine){
 }
 
 /* ============================================================
+   VIEW: RUNNING HOURS  (own section — pill menu ⏱️)
+   User enters each machine's CURRENT total counter reading. The accumulated
+   hours for every hours-based job = its CSV base + how far the counter has
+   advanced since baseline. The readout updates INSTANTLY as the user types,
+   and pressing Update persists it (marking any newly-crossed jobs as due).
+   ============================================================ */
+function rhJobLine(j){
+  const iv=intervalHours(j.interval)||0; const acc=jobAccumHours(j);
+  const due = STATE.hoursDueDate[j.id];
+  const pct = iv? Math.min(100, Math.round(acc/iv*100)) : 0;
+  const stateCls = due? 'rh-due' : (pct>=80?'rh-soon':'');
+  return '<div class="rh-job '+stateCls+'" data-rh-job="'+j.id+'">'+
+      '<div class="rh-job-name">'+esc(j.item)+'</div>'+
+      '<div class="rh-job-meter"><div class="rh-meter-track"><div class="rh-meter-fill" style="width:'+pct+'%"></div></div>'+
+        '<span class="rh-job-num">'+acc.toLocaleString()+' / '+iv.toLocaleString()+' h</span></div>'+
+      (due? '<span class="rh-badge">DUE '+shortDateNoYear(due)+'</span>' : '<span class="rh-remain">'+Math.max(0,iv-acc).toLocaleString()+' h left</span>')+
+    '</div>';
+}
+/* preview accumulated hours for a job GIVEN a hypothetical counter value (not yet saved) */
+function jobAccumHoursPreview(job, previewCounter){
+  const key = machineKey(job);
+  const base = STATE.machineHoursBase[key];
+  const baseAcc = (STATE.hoursJobBase[job.id]!=null) ? STATE.hoursJobBase[job.id]
+                : (job.hrsRun!=null ? job.hrsRun : 0);
+  // if no baseline yet, the first reading establishes it → delta 0
+  const effectiveBase = (base==null) ? previewCounter : base;
+  const delta = Math.max(0, previewCounter - effectiveBase);
+  return baseAcc + delta;
+}
+function renderRunningHours(){
+  const machines = hoursMachines();
+  const view = document.getElementById('view-runninghours');
+  if(!machines.length){
+    view.innerHTML =
+      '<div class="section-title">⏱️ Running Hours</div>'+
+      '<div class="empty-state"><div class="big-icon">⏱️</div><div class="msg">No running-hours jobs</div>'+
+      '<div class="sub">Jobs with an hours interval (e.g. 2000 H) will appear here once imported.</div></div>';
+    return;
+  }
+  const rows = machines.map(mc=>{
+    const cur = STATE.machineHours[mc.key];
+    const jobLines = mc.jobs.slice().sort((a,b)=>(intervalHours(a.interval)||0)-(intervalHours(b.interval)||0)).map(rhJobLine).join('');
+    return '<div class="rh-machine" data-rh-machine="'+esc(mc.key)+'">'+
+        '<div class="rh-head"><div class="rh-mname">'+esc(mc.machine)+'</div><div class="rh-sys">'+esc(mc.system)+'</div></div>'+
+        '<div class="rh-input-row">'+
+          '<label>Current running hours (counter reading)</label>'+
+          '<input type="number" inputmode="numeric" min="0" step="1" class="rh-input" data-mkey="'+esc(mc.key)+'" value="'+(cur!=null?cur:'')+'" placeholder="e.g. 2400">'+
+          '<button class="btn primary rh-save" data-mkey="'+esc(mc.key)+'">Update</button>'+
+        '</div>'+
+        '<div class="rh-preview" data-rh-preview="'+esc(mc.key)+'" style="display:none;"></div>'+
+        (cur!=null?'<div class="rh-current">Last set to <b>'+Number(cur).toLocaleString()+' h</b></div>':'')+
+        '<div class="rh-jobs" data-rh-joblist="'+esc(mc.key)+'">'+jobLines+'</div>'+
+      '</div>';
+  }).join('');
+  view.innerHTML =
+    '<div class="section-title">⏱️ Running Hours</div>'+
+    '<p style="font-size:12.5px; color:var(--text-dim); margin:-6px 0 14px;">Enter each machine\'s current running-hours counter. The bars update live as you type; hours-based jobs become due automatically once their hours are reached, and then appear in Daily / Monthly views.</p>'+
+    '<div class="rh-list">'+rows+'</div>';
+  attachRunningHoursHandlers(view, machines);
+}
+function attachRunningHoursHandlers(view, machines){
+  const byKey = new Map(machines.map(m=>[m.key,m]));
+  view.querySelectorAll('.rh-input').forEach(input=>{
+    const key = input.dataset.mkey;
+    const preview = view.querySelector('.rh-preview[data-rh-preview="'+CSS.escape(key)+'"]');
+    // live preview as the user types
+    input.addEventListener('input', ()=>{
+      const mc = byKey.get(key); if(!mc) return;
+      const listEl = view.querySelector('.rh-jobs[data-rh-joblist="'+CSS.escape(key)+'"]');
+      if(input.value===''){ if(preview) preview.style.display='none';
+        // restore saved rendering
+        if(listEl) listEl.innerHTML = mc.jobs.slice().sort((a,b)=>(intervalHours(a.interval)||0)-(intervalHours(b.interval)||0)).map(rhJobLine).join('');
+        return; }
+      const counter = Number(input.value);
+      if(isNaN(counter) || counter<0){ if(preview){ preview.style.display='block'; preview.style.color='var(--red)'; preview.textContent='Enter a valid number'; } return; }
+      let newlyDue=0;
+      // rebuild each job line with the previewed accumulator
+      if(listEl){
+        listEl.innerHTML = mc.jobs.slice().sort((a,b)=>(intervalHours(a.interval)||0)-(intervalHours(b.interval)||0)).map(j=>{
+          const iv=intervalHours(j.interval)||0; const acc=jobAccumHoursPreview(j, counter);
+          const wasDue=!!STATE.hoursDueDate[j.id]; const nowDue=acc>=iv && iv>0;
+          if(nowDue && !wasDue) newlyDue++;
+          const pct = iv? Math.min(100, Math.round(acc/iv*100)) : 0;
+          const stateCls = nowDue? 'rh-due' : (pct>=80?'rh-soon':'');
+          return '<div class="rh-job '+stateCls+'">'+
+              '<div class="rh-job-name">'+esc(j.item)+'</div>'+
+              '<div class="rh-job-meter"><div class="rh-meter-track"><div class="rh-meter-fill" style="width:'+pct+'%"></div></div>'+
+                '<span class="rh-job-num">'+acc.toLocaleString()+' / '+iv.toLocaleString()+' h</span></div>'+
+              (nowDue? '<span class="rh-badge">'+(wasDue?'DUE '+shortDateNoYear(STATE.hoursDueDate[j.id]):'BECOMES DUE')+'</span>' : '<span class="rh-remain">'+Math.max(0,iv-acc).toLocaleString()+' h left</span>')+
+            '</div>';
+        }).join('');
+      }
+      if(preview){
+        preview.style.display='block'; preview.style.color='var(--interval-hours)';
+        preview.innerHTML = 'Preview at <b>'+counter.toLocaleString()+' h</b>'+(newlyDue>0? ' · <span style="color:var(--amber)">'+newlyDue+' job'+(newlyDue===1?'':'s')+' will become due</span>':'')+' — tap Update to apply';
+      }
+    });
+  });
+  view.querySelectorAll('.rh-save').forEach(btn=> btn.addEventListener('click', ()=>{
+    const key=btn.dataset.mkey;
+    const input=view.querySelector('.rh-input[data-mkey="'+CSS.escape(key)+'"]');
+    if(!input || input.value===''){ toast('Enter running hours'); return; }
+    const prevDue = Object.keys(STATE.hoursDueDate).length;
+    if(setMachineHours(key, input.value)){
+      const nowDue = Object.keys(STATE.hoursDueDate).length;
+      const newly = nowDue - prevDue;
+      toast(newly>0? newly+' job'+(newly===1?'':'s')+' now due' : 'Running hours updated');
+      renderRunningHours();
+    } else { toast('Invalid hours'); }
+  }));
+  view.querySelectorAll('.rh-input').forEach(inp=> inp.addEventListener('keydown', e=>{
+    if(e.key==='Enter'){ const b=view.querySelector('.rh-save[data-mkey="'+CSS.escape(inp.dataset.mkey)+'"]'); if(b) b.click(); }
+  }));
+}
+
+/* ============================================================
    VIEW: UNIVERSAL SEARCH
    ============================================================ */
 function renderSearch(){
@@ -1213,12 +1586,22 @@ function renderSettings(){
       '<div class="cp-date-row" style="max-width:260px;"><input type="date" id="signOffInput" value="'+(STATE.signOffDate||'')+'"></div>'+
       '<div style="margin-top:10px;"><button class="btn primary" id="signOffSaveBtn">Save sign-off date</button>'+(STATE.signOffDate?'<button class="btn" id="signOffClearBtn">Clear</button>':'')+'</div>'+
       (STATE.signOffDate?'<p style="margin-top:10px;margin-bottom:0;">Hiding jobs due after <b>'+shortDate(STATE.signOffDate)+'</b>.</p>':'')+'</div>'+
+    '<div class="panel settings-block"><h4>Feedback &amp; Sound</h4>'+
+      '<p>Play a soft tap sound and vibrate when you switch between the bottom navigation tabs.</p>'+
+      '<div class="toggle-row"><span class="tr-text">Tap sound</span><div class="switch'+(STATE.soundOn?' on':'')+'" id="soundToggle" role="switch" aria-checked="'+(STATE.soundOn?'true':'false')+'"></div></div>'+
+      '<div class="toggle-row"><span class="tr-text">Vibration (haptics)</span><div class="switch'+(STATE.vibrateOn?' on':'')+'" id="vibrateToggle" role="switch" aria-checked="'+(STATE.vibrateOn?'true':'false')+'"></div></div>'+
+    '</div>'+
     '<div class="panel settings-block"><h4>Appearance</h4><p>Switch between dark and light mode. Remembered on this device. Tip: double-tap Spacebar to toggle.</p><button class="btn" id="settingsThemeToggle">Toggle theme</button></div>'+
     '<div class="panel settings-block"><h4>Sync between PC and Mobile</h4><p><b>'+doneCount+'</b> done · <b>'+postponedCount+'</b> postponed · <b>'+activePermits().length+'</b> open permits. Export your progress + permits to carry between devices.</p><button class="btn primary" id="exportBtn">⬇ Export progress (JSON)</button><button class="btn" id="importBtn">⬆ Import progress</button><input type="file" id="importFile" accept="application/json,.json"></div>'+
     '<div class="panel settings-block"><h4>Export as CSV</h4><p>Export the full job list with current status.</p><button class="btn" id="exportCsvBtn">⬇ Export CSV</button></div>'+
-    '<div class="panel settings-block"><h4>About</h4><p style="font-family:var(--font-mono);font-size:11.5px;">Vessel: '+esc(IMPORT_META.vessel||'M.V. Seaways Mirage')+'<br>Company: '+esc(IMPORT_META.company||'Anglo-Eastern Tanker Management')+'<br>Total PMS items: '+RAW.length+'<br><b>This data starts from '+sinceStr+'</b> (PMS export date)<br><br>This app is developed by ETO.</p></div>';
+    '<div class="panel settings-block"><h4>About</h4><p style="font-family:var(--font-mono);font-size:11.5px;">Vessel: '+esc(IMPORT_META.vessel||'M.V. Seaways Mirage')+'<br>Company: '+esc(IMPORT_META.company||'Anglo-Eastern Tanker Management')+'<br>Total PMS items: '+RAW.length+'<br><b>This data starts from '+sinceStr+'</b> (PMS export date)<br>App version: <b>v'+APP_VERSION+'</b><br><br>This app is developed by ETO.</p></div>';
 
   document.getElementById('settingsThemeToggle').addEventListener('click', toggleTheme);
+  // sound / vibration toggles
+  const sw=document.getElementById('soundToggle');
+  if(sw) sw.addEventListener('click', ()=>{ STATE.soundOn=!STATE.soundOn; saveState(); sw.classList.toggle('on',STATE.soundOn); sw.setAttribute('aria-checked',STATE.soundOn?'true':'false'); if(STATE.soundOn) playTapSound(); });
+  const vw=document.getElementById('vibrateToggle');
+  if(vw) vw.addEventListener('click', ()=>{ STATE.vibrateOn=!STATE.vibrateOn; saveState(); vw.classList.toggle('on',STATE.vibrateOn); vw.setAttribute('aria-checked',STATE.vibrateOn?'true':'false'); if(STATE.vibrateOn) hapticTap(); });
   document.getElementById('importJobsBtn').addEventListener('click', ()=> document.getElementById('importJobsFile').click());
   document.getElementById('importJobsFile').addEventListener('change', e=>{
     const file=e.target.files[0]; if(!file) return;
@@ -1231,6 +1614,7 @@ function renderSettings(){
         if(res.vessel||res.company||res.reportDate){ IMPORT_META={ vessel:res.vessel, company:res.company, reportDate:res.reportDate }; }
         try{ localStorage.setItem(IMPORTED_JOBS_KEY, JSON.stringify(RAW)); localStorage.setItem(META_KEY, JSON.stringify(IMPORT_META)); }catch(err){}
         refreshHeader();
+        recomputeHoursDue();
         toast('Imported '+RAW.length+' jobs');
         renderNav(); renderCurrentView();
       }catch(err){ toast('Could not read file — expected PMS CSV or JSON'); }
@@ -1240,7 +1624,7 @@ function renderSettings(){
   document.getElementById('resetJobsBtn').addEventListener('click', ()=>{
     RAW=JSON.parse(document.getElementById('pms-data').textContent); IMPORT_META={vessel:null,company:null,reportDate:null};
     try{ localStorage.removeItem(IMPORTED_JOBS_KEY); localStorage.removeItem(META_KEY); }catch(err){}
-    refreshHeader(); toast('Reset to sample data'); renderNav(); renderCurrentView();
+    refreshHeader(); recomputeHoursDue(); toast('Reset to sample data'); renderNav(); renderCurrentView();
   });
   document.getElementById('signOffSaveBtn').addEventListener('click', ()=>{ STATE.signOffDate=document.getElementById('signOffInput').value||null; saveState(); toast(STATE.signOffDate?'Sign-off date saved':'Sign-off cleared'); renderSettings(); });
   const cbtn=document.getElementById('signOffClearBtn'); if(cbtn) cbtn.addEventListener('click', ()=>{ STATE.signOffDate=null; saveState(); toast('Sign-off cleared'); renderSettings(); });
@@ -1250,7 +1634,9 @@ function renderSettings(){
     const file=e.target.files[0]; if(!file) return; const reader=new FileReader();
     reader.onload=()=>{ try{ const imp=JSON.parse(reader.result); if(imp&&typeof imp==='object'){
       if(imp.statuses) STATE.statuses=imp.statuses; if(imp.jobMeta) STATE.jobMeta=imp.jobMeta; if(imp.jobDueOverride) STATE.jobDueOverride=imp.jobDueOverride; if(imp.permits) STATE.permits=imp.permits; if('signOffDate' in imp) STATE.signOffDate=imp.signOffDate; if(imp.theme) STATE.theme=imp.theme;
-      saveState(); toast('Progress imported'); renderNav(); renderCurrentView(); } else toast('Invalid file'); }catch(err){ toast('Could not read file'); } };
+      if(imp.machineHours) STATE.machineHours=imp.machineHours; if(imp.machineHoursBase) STATE.machineHoursBase=imp.machineHoursBase; if(imp.hoursJobBase) STATE.hoursJobBase=imp.hoursJobBase; if(imp.hoursDueDate) STATE.hoursDueDate=imp.hoursDueDate;
+      if(Array.isArray(imp.importantDates)) STATE.importantDates=imp.importantDates; if('soundOn' in imp) STATE.soundOn=imp.soundOn; if('vibrateOn' in imp) STATE.vibrateOn=imp.vibrateOn;
+      recomputeHoursDue(); saveState(); toast('Progress imported'); renderNav(); renderCurrentView(); } else toast('Invalid file'); }catch(err){ toast('Could not read file'); } };
     reader.readAsText(file);
   });
   document.getElementById('exportCsvBtn').addEventListener('click', ()=>{
@@ -1278,6 +1664,31 @@ function initTheme(){ applyTheme(STATE.theme||'dark'); }
    ============================================================ */
 let toastTimer=null;
 function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; el.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.classList.remove('show'),1800); }
+
+/* ============================================================
+   FEEDBACK — soft tap sound (WebAudio, no assets) + haptic vibration
+   Both are user-toggleable in Settings; default ON. Audio must be created
+   after a user gesture (nav taps qualify), so we lazily build the context.
+   ============================================================ */
+let _audioCtx=null;
+function playTapSound(){
+  if(!STATE.soundOn) return;
+  try{
+    const AC = window.AudioContext||window.webkitAudioContext; if(!AC) return;
+    if(!_audioCtx) _audioCtx = new AC();
+    if(_audioCtx.state==='suspended') _audioCtx.resume();
+    const t=_audioCtx.currentTime;
+    const osc=_audioCtx.createOscillator(); const gain=_audioCtx.createGain();
+    osc.type='sine'; osc.frequency.setValueAtTime(660, t); osc.frequency.exponentialRampToValueAtTime(440, t+0.05);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.12, t+0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t+0.13);
+    osc.connect(gain); gain.connect(_audioCtx.destination);
+    osc.start(t); osc.stop(t+0.14);
+  }catch(e){}
+}
+function hapticTap(){ if(!STATE.vibrateOn) return; try{ if(navigator.vibrate) navigator.vibrate(12); }catch(e){} }
+function navFeedback(){ playTapSound(); hapticTap(); }
 
 /* ============================================================
    HEADER
@@ -1365,6 +1776,7 @@ function init(){
   window.addEventListener('resize', ()=>{ detectDesktop(); moveNavSlider(); });
   initTheme();
   reflashPostponedPermits();
+  recomputeHoursDue();
   refreshHeader();
   document.getElementById('themeToggle').addEventListener('click', toggleTheme);
   document.getElementById('permitBell').addEventListener('click', openPermitModal);
