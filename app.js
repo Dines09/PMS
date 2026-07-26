@@ -7,7 +7,7 @@
 "use strict";
 
 /* ---------- App version ---------- */
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 
 /* ---------- Storage keys ---------- */
 const IMPORTED_JOBS_KEY = 'pms_dashboard_imported_jobs_v3';
@@ -44,6 +44,7 @@ STATE.machineHoursAdded = STATE.machineHoursAdded || {}; // machineKey -> cumula
 STATE.hoursJobBase  = STATE.hoursJobBase  || {};   // id -> job's own accumulated hrs snapshot at its last reset (completing a job snaps this so its counter restarts at 0)
 STATE.hoursDueDate  = STATE.hoursDueDate  || {};   // id -> ISO date the hours-job first crossed its interval (its due date)
 STATE.importantDates= STATE.importantDates|| [];   // [{id, date:ISO, text}] user-added reminders (Home)
+STATE.postponedUntil= STATE.postponedUntil|| {};   // occurrence key -> ISO date the user postponed that occurrence to
 if(STATE.soundOn   ===undefined) STATE.soundOn   = true;   // tap sound on nav switch (default ON)
 if(STATE.vibrateOn ===undefined) STATE.vibrateOn = true;   // haptic vibration on nav switch (default ON)
 
@@ -367,7 +368,6 @@ function updatePermitBell(){
   if(n>0){ count.textContent=n; count.style.display='flex'; bell.classList.add('flash'); }
   else { count.style.display='none'; bell.classList.remove('flash'); }
   document.querySelectorAll('[data-focus-badge]').forEach(el=>{ if(n>0){ el.textContent=n; el.style.display='flex'; } else el.style.display='none'; });
-  const tb=document.getElementById('chipToggleBadge'); if(tb){ if(n>0){ tb.textContent=n; tb.style.display='flex'; } else tb.style.display='none'; }
 }
 
 /* ============================================================
@@ -388,8 +388,8 @@ const TABS = [
   {id:'settings', label:'Settings',icon:'⚙'},
 ];
 const BOTTOM_TABS = ['home','daily','month','settings'];
-/* chip order requested: machines, running hours, critical, done, postponed, motor starters, weekly */
-const CHIP_TABS   = ['machines','runninghours','critical','done','postponed','focus','weekly'];
+/* chip order: critical sits next to machines; running hours shifts further back */
+const CHIP_TABS   = ['machines','critical','done','postponed','focus','weekly','runninghours'];
 
 /* ---------- Navigation state (drill-downs) ---------- */
 const nav = {
@@ -399,7 +399,8 @@ const nav = {
   focusMonth:null, monthBucket:null,
   critMonth:'all',
   searchQuery:'',
-  focusPermitsOpen:false,
+  impDatesOpen:false,      // Important Dates panel starts collapsed
+  homePermitsOpen:false,   // Home PTW-06 panel starts collapsed
   __dayModal:null
 };
 
@@ -486,15 +487,18 @@ function renderNav(){
     const badge = id==='focus' ? '<span class="chip-badge" data-focus-badge style="display:none;">0</span>' : '';
     return '<button class="chip '+(id===nav.tab?'active':'')+'" data-tab="'+id+'"><span class="c-icon">'+t.icon+'</span><span>'+t.label+'</span>'+badge+'</button>';
   }).join('');
-  cr.querySelectorAll('.chip').forEach(b=> b.addEventListener('click', ()=>{ navFeedback(); switchTab(b.dataset.tab); collapseChips(); }));
+  cr.querySelectorAll('.chip').forEach(b=> b.addEventListener('click', ()=>{ navFeedback(); switchTab(b.dataset.tab); scrollChipIntoView(b.dataset.tab); }));
   updatePermitBell();
-  requestAnimationFrame(moveNavSlider);
+  requestAnimationFrame(()=>{ moveNavSlider(); scrollChipIntoView(nav.tab); });
 }
 
-/* ---------- Collapsible chip zone ---------- */
-function collapseChips(){ const z=document.getElementById('chipZone'); if(z) z.classList.add('collapsed'); }
-function expandChips(){ const z=document.getElementById('chipZone'); if(z) z.classList.remove('collapsed'); }
-function toggleChips(){ const z=document.getElementById('chipZone'); if(z) z.classList.toggle('collapsed'); }
+/* The chip row is always expanded now; keep the active chip in view as tabs change. */
+function scrollChipIntoView(tabId){
+  const cr = document.getElementById('chipRow'); if(!cr) return;
+  const el = cr.querySelector('.chip[data-tab="'+tabId+'"]'); if(!el) return;
+  const target = el.offsetLeft - (cr.clientWidth - el.offsetWidth)/2;
+  cr.scrollTo({ left: Math.max(0, target), behavior:'smooth' });
+}
 
 function renderCurrentView(){
   switch(nav.tab){
@@ -632,10 +636,30 @@ function completeJob(id, opts){
   if(isFocusJob(job)) createPermitForJob(job, doneDate);
   saveState();
 }
-function postponeJob(id, occDate){
+/* Mark an occurrence postponed and push its due date out to `newDue`. */
+function postponeJob(id, occDate, newDue){
   const job = RAW.find(j=>j.id===id); if(!job) return;
   const key = job.id+'@'+(occDate||getJobDue(job));
-  setStatusForKey(key,'postponed'); toast('Postponed'); refreshAll();
+  setStatusForKey(key,'postponed');
+  if(newDue){
+    STATE.postponedUntil = STATE.postponedUntil || {};
+    STATE.postponedUntil[key] = newDue;
+    saveState();
+  }
+  toast(newDue ? 'Postponed to '+shortDate(newDue) : 'Postponed');
+  refreshAll();
+}
+/* Ask WHEN to postpone to (same wheel picker as Complete), then postpone. */
+function openPostponePopup(id, occDate){
+  const job = RAW.find(j=>j.id===id); if(!job) return;
+  const curDue = occDate || getJobDue(job) || TODAY;
+  openDatePickerSheet({
+    title: 'Postpone — '+job.item,
+    initial: addDays(curDue >= TODAY ? curDue : TODAY, 7),   // sensible default: a week out
+    okLabel: 'Postpone',
+    note: '⏸️ Currently due '+shortDate(curDue)+'.',
+    onOk: (iso)=> postponeJob(id, occDate, iso)
+  });
 }
 
 function attachJobActions(container){
@@ -648,7 +672,7 @@ function attachJobActions(container){
         e.stopPropagation();
         const action = btn.dataset.action;
         if(action==='undo'){ clearJob(id, occDate); return; }
-        if(action==='postponed'){ postponeJob(id, occDate); return; }
+        if(action==='postponed'){ openPostponePopup(id, occDate); return; }
         if(action==='done'){ openCompletePopup(id); }
       });
     });
@@ -721,8 +745,9 @@ function attachSwipeAndFlip(container){
           resetPos();
           openCompletePopup(id);
         } else {
-          inner.style.transition='transform .2s ease'; inner.style.transform='translateX(-'+window.innerWidth+'px)';
-          setTimeout(()=>{ postponeJob(id, occDate); }, 170);
+          // swipe left → ask which date to postpone to (same wheel picker as Complete)
+          resetPos();
+          openPostponePopup(id, occDate);
         }
         return;
       }
@@ -742,6 +767,46 @@ function attachSwipeAndFlip(container){
 }
 
 /* ============================================================
+   GENERIC HORIZONTAL SWIPE
+   Attaches left/right swipe navigation to any element (empty areas of the
+   month calendar, the day header, …). Vertical drags are left alone so the
+   page still scrolls normally. onLeft = swiped leftwards (→ next),
+   onRight = swiped rightwards (→ previous).
+   ============================================================ */
+function attachHSwipe(el, onLeft, onRight, opts){
+  if(!el) return;
+  const T = (opts && opts.threshold) || 60;
+  let startX=0, startY=0, dx=0, decided=false, isH=false, active=false;
+  el.addEventListener('touchstart', e=>{
+    if(e.touches.length!==1) { active=false; return; }
+    // ignore drags that start on an interactive child (buttons, cells with jobs…)
+    if(opts && opts.ignoreSelector && e.target.closest(opts.ignoreSelector)) { active=false; return; }
+    const t=e.touches[0]; startX=t.clientX; startY=t.clientY; dx=0;
+    active=true; decided=false; isH=false;
+  }, {passive:true});
+  el.addEventListener('touchmove', e=>{
+    if(!active) return;
+    const t=e.touches[0]; const diffX=t.clientX-startX, diffY=t.clientY-startY;
+    if(!decided){
+      if(Math.abs(diffX)>10 || Math.abs(diffY)>10){ decided=true; isH = Math.abs(diffX) > Math.abs(diffY)*1.3; }
+    }
+    if(!isH) return;
+    e.preventDefault();
+    dx=diffX;
+    el.style.transition='none';
+    el.style.transform='translateX('+(dx*0.28)+'px)';   // subtle rubber-band feedback
+    el.style.opacity = String(1 - Math.min(0.35, Math.abs(dx)/700));
+  }, {passive:false});
+  const settle = ()=>{ el.style.transition='transform .18s ease, opacity .18s ease'; el.style.transform=''; el.style.opacity=''; };
+  el.addEventListener('touchend', ()=>{
+    if(!active) return; active=false;
+    const d=dx; settle();
+    if(isH && Math.abs(d)>=T){ if(d<0){ if(onLeft) onLeft(); } else { if(onRight) onRight(); } }
+  });
+  el.addEventListener('touchcancel', ()=>{ active=false; settle(); });
+}
+
+/* ============================================================
    COMPLETE POPUP — bottom sheet with location + scrollable date wheels
    ============================================================ */
 function closePopover(){ document.getElementById('popoverRoot').innerHTML=''; }
@@ -751,17 +816,77 @@ function wheelColumn(name, items, selectedVal){
   const opts = items.map(it=> '<div class="wheel-item" data-val="'+it.v+'">'+it.label+'</div>').join('');
   return '<div class="wheel" data-wheel="'+name+'" data-val="'+selectedVal+'"><div class="wheel-track">'+opts+'</div></div>';
 }
+
+/* Markup for a day/month/year wheel trio, pre-selected to `iso`. */
+function dateWheelsHtml(iso){
+  const base = parseISO(iso || TODAY);
+  const curY = base.getFullYear();
+  const years=[]; for(let y=curY-3; y<=curY+5; y++) years.push({v:y,label:String(y)});
+  const months = MON.map((m,i)=>({v:i+1,label:m.slice(0,3)}));
+  const days=[]; for(let d=1; d<=31; d++) days.push({v:d,label:String(d)});
+  return '<div class="wheel-row">'+
+      wheelColumn('day', days, base.getDate())+
+      wheelColumn('mon', months, base.getMonth()+1)+
+      wheelColumn('year', years, curY)+
+      '<div class="wheel-highlight"></div>'+
+    '</div>';
+}
+/* Read the current wheel selection out of `scope` as an ISO date string. */
+function readDateWheels(scope){
+  const d = +scope.querySelector('[data-wheel="day"]').dataset.val;
+  const m = +scope.querySelector('[data-wheel="mon"]').dataset.val;
+  const y = +scope.querySelector('[data-wheel="year"]').dataset.val;
+  const lastDay = new Date(y, m, 0).getDate();       // clamp 31 Feb → 28/29 Feb
+  return y+'-'+String(m).padStart(2,'0')+'-'+String(Math.min(d,lastDay)).padStart(2,'0');
+}
+
+/* Generic "pick a date" bottom sheet built on the same wheels as Complete.
+   opts = {title, initial, okLabel, note, onOk(iso)} */
+function openDatePickerSheet(opts){
+  closePopover();
+  const root = document.getElementById('popoverRoot');
+  root.innerHTML =
+    '<div class="sheet-overlay" id="dpOverlay"></div>'+
+    '<div class="complete-sheet" id="dpSheet">'+
+      '<div class="cs-grip"></div>'+
+      '<div class="cs-title">'+esc(opts.title||'Pick a date')+'</div>'+
+      '<div class="cs-sub">Date <span style="color:var(--text-faint);font-weight:600;">(scroll ↕)</span></div>'+
+      dateWheelsHtml(opts.initial||TODAY)+
+      (opts.note? '<div class="cs-permit">'+opts.note+'</div>' : '')+
+      '<div class="cs-actions"><button class="btn" id="dpCancel">Cancel</button>'+
+        '<button class="btn primary" id="dpOk">'+esc(opts.okLabel||'OK')+'</button></div>'+
+    '</div>';
+  document.getElementById('dpOverlay').addEventListener('click', closePopover);
+  document.getElementById('dpCancel').addEventListener('click', closePopover);
+  root.querySelectorAll('.wheel').forEach(setupWheel);
+  document.getElementById('dpOk').addEventListener('click', ()=>{
+    const iso = readDateWheels(root);
+    closePopover();
+    if(opts.onOk) opts.onOk(iso);
+  });
+}
+
+/* Generic confirm bottom sheet — used for destructive actions (delete, reset). */
+function openConfirmSheet(opts){
+  const root = document.getElementById('popoverRoot');
+  root.innerHTML =
+    '<div class="sheet-overlay" id="cfOverlay"></div>'+
+    '<div class="exit-sheet">'+
+      '<div class="exit-title">'+esc(opts.title||'Are you sure?')+'</div>'+
+      (opts.body? '<div style="font-size:12.5px;color:var(--text-dim);text-align:center;margin:-6px 0 14px;">'+esc(opts.body)+'</div>' : '')+
+      '<div class="exit-actions"><button class="btn" id="cfCancel">'+esc(opts.cancelLabel||'Cancel')+'</button>'+
+        '<button class="btn '+(opts.danger===false?'primary':'danger')+'" id="cfOk">'+esc(opts.okLabel||'Delete')+'</button></div>'+
+    '</div>';
+  const close=()=>{ root.innerHTML=''; if(opts.onCancel) opts.onCancel(); };
+  document.getElementById('cfOverlay').addEventListener('click', close);
+  document.getElementById('cfCancel').addEventListener('click', close);
+  document.getElementById('cfOk').addEventListener('click', ()=>{ root.innerHTML=''; if(opts.onOk) opts.onOk(); });
+}
 function openCompletePopup(jobId){
   closePopover();
   const job = RAW.find(j=>j.id===jobId); if(!job) return;
   const focus = isFocusJob(job);
   const root = document.getElementById('popoverRoot');
-  const now = parseISO(TODAY);
-  const curY = now.getFullYear();
-  const years = []; for(let y=curY-2;y<=curY+3;y++) years.push({v:y,label:String(y)});
-  const months = MON.map((m,i)=>({v:i+1,label:m.slice(0,3)}));
-  const days = []; for(let d=1;d<=31;d++) days.push({v:d,label:String(d)});
-  const selD = now.getDate(), selM = now.getMonth()+1, selY = curY;
 
   root.innerHTML =
     '<div class="sheet-overlay" id="cpOverlay"></div>'+
@@ -775,12 +900,7 @@ function openCompletePopup(jobId){
         '<button class="cs-loc-btn" data-loc="At Anchor">At Anchor</button>'+
       '</div>'+
       '<div class="cs-sub">Done date <span style="color:var(--text-faint);font-weight:600;">(scroll ↕)</span></div>'+
-      '<div class="wheel-row">'+
-        wheelColumn('day', days, selD)+
-        wheelColumn('mon', months, selM)+
-        wheelColumn('year', years, selY)+
-        '<div class="wheel-highlight"></div>'+
-      '</div>'+
+      dateWheelsHtml(TODAY)+
       (focus?'<div class="cs-permit">📋 A PTW-06 permit will be raised (due on this done date).</div>':'')+
       '<div class="cs-actions"><button class="btn" id="cpCancel">Cancel</button><button class="btn primary" id="cpOk">OK</button></div>'+
     '</div>';
@@ -796,11 +916,7 @@ function openCompletePopup(jobId){
 
   document.getElementById('cpOk').addEventListener('click', ()=>{
     const loc = root.querySelector('.cs-loc-btn.active').dataset.loc;
-    const d = +root.querySelector('[data-wheel="day"]').dataset.val;
-    const m = +root.querySelector('[data-wheel="mon"]').dataset.val;
-    const y = +root.querySelector('[data-wheel="year"]').dataset.val;
-    const lastDay = new Date(y, m, 0).getDate();
-    const doneDate = y+'-'+String(m).padStart(2,'0')+'-'+String(Math.min(d,lastDay)).padStart(2,'0');
+    const doneDate = readDateWheels(root);
     completeJob(jobId, {location:loc, doneDate});
     closePopover(); toast('Marked complete'); refreshAll();
     // offer to apply the same done date to due sibling jobs on this machine
@@ -981,7 +1097,24 @@ function renderHome(){
   const ringR=46, circ=2*Math.PI*ringR, ringOffset=circ-(overallPct/100)*circ;
   const permits = activePermits();
 
+  // Criticals due within the next 7 days — surfaced ABOVE everything else on Home
+  const crit7 = jobsAll.filter(j=>{
+    if(!j.critical || getStatus(j)==='done') return false;
+    const d = getJobDue(j); if(!d) return false;
+    return d <= addDays(TODAY,7);              // includes anything already overdue
+  }).sort((a,b)=> getJobDue(a).localeCompare(getJobDue(b)));
+
   document.getElementById('view-home').innerHTML =
+    (crit7.length?
+      '<div class="home-panel" style="margin:0 0 14px; border-color:var(--crit); background:var(--crit-soft);">'+
+        '<h3 style="color:var(--crit);margin-bottom:10px;">⚠️ Critical — next 7 days ('+crit7.length+')</h3>'+
+        crit7.slice(0,6).map(j=>{ const d=getJobDue(j); const late=d<TODAY;
+          return '<div class="upcoming-crit-item" data-goto-daily-crit="'+d+'" style="background:var(--bg-panel);">'+
+            '<span>'+esc(j.item)+' <span style="color:var(--text-faint);">· '+esc(j.machine)+'</span></span>'+
+            '<span class="uc-date"'+(late?' style="color:var(--red);"':'')+'>'+(late?'OVERDUE · ':'')+shortDateNoYear(d)+'</span></div>';
+        }).join('')+
+        (crit7.length>6?'<div style="font-size:11.5px;color:var(--crit);font-weight:700;margin-top:6px;cursor:pointer;" id="homeAllCrit">View all '+crit7.length+' criticals →</div>':'')+
+      '</div>':'')+
     '<div class="progress-hero" style="margin:0 0 14px;"><div class="ph-top"><span>Today\'s Progress</span><b>'+todayPct+'%</b></div><div class="bar"><div class="fill" style="width:'+todayPct+'%"></div></div></div>'+
     '<div class="stat-strip">'+
       '<div class="stat-card" data-counter="total"><div class="num">'+s.total+'</div><div class="label">Total</div></div>'+
@@ -991,8 +1124,14 @@ function renderHome(){
       '<div class="stat-card motor" data-counter="motor"><div class="num">'+s.motor+'</div><div class="label">Motor Starters</div></div>'+
     '</div>'+
     importantDatesPanel()+
+    // PTW-06 stays collapsed (permits eat a lot of space); tapping opens the full permits window
     (permits.length?
-      '<div class="home-panel" style="margin-top:14px; border-color:var(--permit);"><h3 style="color:var(--permit);">📋 PTW-06 Permits Pending — '+permits.length+'</h3>'+permits.slice(0,4).map(permitRow).join('')+(permits.length>4?'<button class="btn" id="homeMorePermits" style="margin-top:6px;">View all '+permits.length+' permits</button>':'')+'</div>':'')+
+      '<div class="home-panel" style="margin-top:14px; border-color:var(--permit);">'+
+        '<div class="collapse-head" id="homePermitHead">'+
+          '<h3 style="color:var(--permit);margin:0;">📋 PTW-06 Permits Pending <span class="collapse-count" style="color:var(--permit);background:var(--permit-soft);">'+permits.length+'</span></h3>'+
+          '<span class="ch-chev" style="color:var(--permit);">›</span>'+
+        '</div>'+
+      '</div>':'')+
     '<div class="home-grid" style="margin-top:14px;">'+
       '<div class="home-panel">'+
         '<h3>Overall Completion</h3>'+
@@ -1020,7 +1159,8 @@ function renderHome(){
   }));
   document.querySelectorAll('[data-goto-daily]').forEach(el=> el.addEventListener('click', ()=> go(()=>{ nav.date=el.dataset.gotoDaily; nav.tab='daily'; })));
   document.querySelectorAll('[data-goto-daily-crit]').forEach(el=> el.addEventListener('click', ()=> go(()=>{ nav.date=el.dataset.gotoDailyCrit; nav.tab='daily'; })));
-  const mp=document.getElementById('homeMorePermits'); if(mp) mp.addEventListener('click', openPermitModal);
+  const ph=document.getElementById('homePermitHead'); if(ph) ph.addEventListener('click', openPermitModal);
+  const ac=document.getElementById('homeAllCrit'); if(ac) ac.addEventListener('click', ()=> switchTab('critical'));
   attachPermitActions(document.getElementById('view-home'));
   attachImportantDatesHandlers();
 }
@@ -1040,29 +1180,76 @@ function relDateLabel(iso){
   if(diff>1) return 'in '+diff+' days';
   return Math.abs(diff)+' days ago';
 }
+/* Collapsed by default — the list can get long, so it only opens on tap. */
 function importantDatesPanel(){
-  const items = sortedImportantDates();
+  const items = sortedImportantDates();   // latest date first (descending)
+  const open = !!nav.impDatesOpen;
   const rows = items.length
     ? items.map(it=>{ const p=duePillParts(it.date); const yr=parseISO(it.date).getFullYear();
-        return '<div class="impdate-item" data-impid="'+it.id+'">'+
-            '<div class="impdate-pill"><span class="id-day">'+p.day+'</span><span class="id-mon">'+p.mon+'</span><span class="id-yr">'+yr+'</span></div>'+
-            '<div class="impdate-body"><div class="id-text">'+esc(it.text)+'</div><div class="id-rel">'+relDateLabel(it.date)+'</div></div>'+
-            '<button class="impdate-del" data-impdel="'+it.id+'" title="Delete">✕</button>'+
+        return '<div class="impdate-swipe" data-impswipe="'+it.id+'">'+
+            '<div class="id-swipe-bg"><span>🗑 Delete</span><span>Delete 🗑</span></div>'+
+            '<div class="impdate-item" data-impid="'+it.id+'">'+
+              '<div class="impdate-pill"><span class="id-day">'+p.day+'</span><span class="id-mon">'+p.mon+'</span><span class="id-yr">'+yr+'</span></div>'+
+              '<div class="impdate-body"><div class="id-text">'+esc(it.text)+'</div><div class="id-rel">'+relDateLabel(it.date)+'</div></div>'+
+            '</div>'+
           '</div>';
-      }).join('')
+      }).join('') + '<div class="impdates-empty" style="padding:6px 4px 0;">Swipe a row left or right to delete it.</div>'
     : '<div class="impdates-empty">No important dates yet. Tap + to add an inspection, test, or any date you want to remember.</div>';
   return '<div class="impdates-panel">'+
-      '<div class="impdates-head"><h3>📌 Important Dates</h3><button class="impdates-add" id="impdateAddBtn" title="Add important date">+</button></div>'+
-      rows+
+      '<div class="impdates-head">'+
+        '<div class="collapse-head'+(open?' open':'')+'" id="impdateHead" style="flex:1;">'+
+          '<h3>📌 Important Dates'+(items.length?' <span class="collapse-count">'+items.length+'</span>':'')+'</h3>'+
+          '<span class="ch-chev">▾</span>'+
+        '</div>'+
+        '<button class="impdates-add" id="impdateAddBtn" title="Add important date" style="margin-left:10px;">+</button>'+
+      '</div>'+
+      (open? rows : '')+
     '</div>';
 }
 function attachImportantDatesHandlers(){
-  const add=document.getElementById('impdateAddBtn'); if(add) add.addEventListener('click', openImportantDateForm);
-  document.querySelectorAll('[data-impdel]').forEach(btn=> btn.addEventListener('click', ()=>{
-    const id=Number(btn.dataset.impdel);
-    STATE.importantDates = (STATE.importantDates||[]).filter(x=>x.id!==id);
-    saveState(); toast('Removed'); renderHome();
-  }));
+  const add=document.getElementById('impdateAddBtn');
+  if(add) add.addEventListener('click', e=>{ e.stopPropagation(); openImportantDateForm(); });
+  const head=document.getElementById('impdateHead');
+  if(head) head.addEventListener('click', ()=>{ nav.impDatesOpen = !nav.impDatesOpen; renderHome(); });
+  // swipe left OR right on a row → confirm sheet → delete. No bare-tap delete any more.
+  document.querySelectorAll('[data-impswipe]').forEach(wrap=>{
+    const id = Number(wrap.dataset.impswipe);
+    const row = wrap.querySelector('.impdate-item');
+    const bg  = wrap.querySelector('.id-swipe-bg');
+    const item = (STATE.importantDates||[]).find(x=>x.id===id);
+    let startX=0,startY=0,dx=0,dragging=false,decided=false,isH=false;
+    const T=70;
+    const reset=()=>{ row.style.transition='transform .2s ease'; row.style.transform=''; bg.style.opacity=0; };
+    row.addEventListener('touchstart', e=>{
+      const t=e.touches[0]; startX=t.clientX; startY=t.clientY; dx=0;
+      dragging=true; decided=false; isH=false; row.style.transition='none';
+    }, {passive:true});
+    row.addEventListener('touchmove', e=>{
+      if(!dragging) return;
+      const t=e.touches[0]; const diffX=t.clientX-startX, diffY=t.clientY-startY;
+      if(!decided){ if(Math.abs(diffX)>8||Math.abs(diffY)>8){ decided=true; isH=Math.abs(diffX)>Math.abs(diffY); } }
+      if(!isH) return;
+      e.preventDefault(); dx=diffX;
+      row.style.transform='translateX('+dx+'px)';
+      bg.style.opacity=Math.min(1, Math.abs(dx)/T);
+    }, {passive:false});
+    row.addEventListener('touchend', ()=>{
+      if(!dragging) return; dragging=false;
+      const d=dx; reset();
+      if(isH && Math.abs(d)>=T){
+        openConfirmSheet({
+          title:'Delete this important date?',
+          body: item ? item.text : '',
+          okLabel:'Delete',
+          onOk:()=>{
+            STATE.importantDates = (STATE.importantDates||[]).filter(x=>x.id!==id);
+            saveState(); toast('Deleted'); renderHome();
+          }
+        });
+      }
+    });
+    row.addEventListener('touchcancel', reset);
+  });
 }
 function openImportantDateForm(){
   const root=document.getElementById('popoverRoot');
@@ -1074,23 +1261,25 @@ function openImportantDateForm(){
       '<div class="impdate-form">'+
         '<div><div class="cs-sub" style="margin-top:0;">What is it?</div>'+
           '<input type="text" id="impText" maxlength="120" placeholder="e.g. Annual survey, PSC inspection, Lifeboat drill" autocomplete="off"></div>'+
-        '<div><div class="cs-sub">Date</div>'+
-          '<input type="date" id="impDate" value="'+TODAY+'"></div>'+
       '</div>'+
+      '<div class="cs-sub">Date <span style="color:var(--text-faint);font-weight:600;">(scroll ↕)</span></div>'+
+      dateWheelsHtml(TODAY)+
       '<div class="cs-actions"><button class="btn" id="impCancel">Cancel</button><button class="btn primary" id="impSave">Save</button></div>'+
     '</div>';
   const close=()=>{ root.innerHTML=''; };
   document.getElementById('impOverlay').addEventListener('click', close);
   document.getElementById('impCancel').addEventListener('click', close);
+  root.querySelectorAll('.wheel').forEach(setupWheel);
   setTimeout(()=>{ const t=document.getElementById('impText'); if(t) t.focus(); }, 50);
   document.getElementById('impSave').addEventListener('click', ()=>{
     const text=(document.getElementById('impText').value||'').trim();
-    const date=document.getElementById('impDate').value||'';
     if(!text){ toast('Enter a description'); return; }
-    if(!date){ toast('Pick a date'); return; }
+    const date = readDateWheels(root);
     STATE.importantDates = STATE.importantDates||[];
     STATE.importantDates.push({ id:Date.now(), date, text });
-    saveState(); close(); toast('Important date added'); renderHome();
+    saveState(); close(); toast('Important date added');
+    nav.impDatesOpen = true;   // open the list so the new entry is visible
+    renderHome();
   });
 }
 
@@ -1136,18 +1325,27 @@ function renderDaily(){
   const isToday = nav.date===TODAY;
   const quote = NO_JOBS_QUOTES[Math.abs(nav.date.split('').reduce((a,c)=>a+c.charCodeAt(0),0))%NO_JOBS_QUOTES.length];
   document.getElementById('view-daily').innerHTML =
-    '<div class="day-nav">'+
+    // the whole day header is a swipe zone: ← next day, → previous day
+    '<div class="day-nav swipe-zone" id="dayNav">'+
       '<button class="arrow-btn" id="dayPrev">‹</button>'+
-      '<div class="day-label"><span class="dl-date">'+shortDate(nav.date)+'</span><span class="sub">'+(isToday?'Today':(parseISO(nav.date)<parseISO(TODAY)? Math.abs(daysBetween(nav.date,TODAY))+' days ago':'in '+daysBetween(TODAY,nav.date)+' days'))+'</span></div>'+
+      '<div class="day-label">'+
+        '<span class="dl-date">'+shortDate(nav.date)+'</span>'+
+        '<span class="sub">'+(isToday?'Today':(parseISO(nav.date)<parseISO(TODAY)? Math.abs(daysBetween(nav.date,TODAY))+' days ago':'in '+daysBetween(TODAY,nav.date)+' days'))+'</span>'+
+        // "Today" lives inside the centred label so it can't be hit while tapping ›
+        (!isToday?'<button class="today-btn" id="dayToday">⤺ Today</button>':'')+
+      '</div>'+
       '<button class="arrow-btn" id="dayNext">›</button>'+
-      (!isToday?'<button class="today-btn" id="dayToday">Today</button>':'')+
     '</div>'+
+    '<div class="swipe-hint">‹ swipe the date bar to change day ›</div>'+
     safetyBannerHtml()+
     '<div class="progress-bar-wrap"><div class="progress-bar-track"><div class="progress-bar-fill" style="width:'+pct+'%"></div></div><div class="progress-pct">'+pct+'%</div></div>'+
     '<div class="job-list" id="dailyJobList">'+(occs.length? occs.map(o=>jobCard(o.job,{occDate:o.date, occStatus:o.status})).join('') : '<div class="empty-state"><div class="big-icon">⚓</div><div class="msg">'+quote+'</div></div>')+'</div>';
   document.getElementById('dayPrev').addEventListener('click', ()=>navDay(-1));
   document.getElementById('dayNext').addEventListener('click', ()=>navDay(1));
   const tb=document.getElementById('dayToday'); if(tb) tb.addEventListener('click', ()=> go(()=>{ nav.date=TODAY; }));
+  // swipe the date bar itself (empty space around the date) to change day
+  attachHSwipe(document.getElementById('dayNav'), ()=>navDay(1), ()=>navDay(-1),
+               { ignoreSelector:'.arrow-btn, .today-btn' });
   attachJobActions(document.getElementById('dailyJobList'));
 }
 function navDay(delta){ go(()=>{ nav.date=addDays(nav.date,delta); }); }
@@ -1184,19 +1382,30 @@ function statusOccurrences(kind){
     const job = byId.get(id); if(!job) return;
     if(STATE.signOffDate && occDue > STATE.signOffDate) return;
     const meta = STATE.jobMeta[key];
-    out.push({ job, occDue, doneDate: (meta&&meta.doneDate)||occDue, key });
+    out.push({ job, occDue, doneDate: (meta&&meta.doneDate)||occDue, key,
+               postponedTo: (STATE.postponedUntil||{})[key] || null });
   });
   return out;
 }
 /* render a job card for a fixed occurrence (Done/Postponed lists) */
 function occurrenceCard(occ, kind){
   const job = occ.job;
-  const dateShown = kind==='done' ? occ.doneDate : occ.occDue;   // done → the date it was actually done
+  const dateShown = kind==='done' ? occ.doneDate : (occ.postponedTo || occ.occDue);
   const dp = duePillParts(dateShown);
   const cls = ['job-card', kind==='done'?'is-done':'is-postponed'];
   const pillCls = kind==='done'?'done':'overdue';
   const icls = intervalColorClass(job.interval);
   const corner = kind==='done' ? '<div class="corner-tag done">Completed</div>' : '<div class="corner-tag postp">Postponed</div>';
+  const extraTag = kind==='done'
+    ? '<span class="tag interval-grey">Done '+shortDateNoYear(occ.doneDate)+'</span>'
+    : (occ.postponedTo ? '<span class="tag interval-blue">→ '+shortDateNoYear(occ.postponedTo)+'</span>' : '');
+  const actions = kind==='done'
+    ? '<div class="job-actions">'+
+        '<button class="act-btn complete" data-occ-editdate="'+occ.key+'" data-job-id="'+job.id+'" title="Change done date">📅</button>'+
+        '<button class="act-btn undo" data-occ-undo="'+occ.key+'" data-job-id="'+job.id+'" title="Undo">↺</button></div>'
+    : '<div class="job-actions">'+
+        '<button class="act-btn postpone" data-occ-editdate="'+occ.key+'" data-job-id="'+job.id+'" title="Change postponed date">📅</button>'+
+        '<button class="act-btn undo" data-occ-undo="'+occ.key+'" data-job-id="'+job.id+'" title="Undo">↺</button></div>';
   const front =
     '<div class="'+cls.join(' ')+'" data-occ-key="'+occ.key+'" data-job-id="'+job.id+'">'+
       corner+
@@ -1208,17 +1417,121 @@ function occurrenceCard(occ, kind){
         '<div class="job-tags">'+
           '<span class="tag '+icls+'">'+esc(intervalLabel(job.interval))+'</span>'+
           (job.critical?'<span class="tag crit">Critical</span>':'')+
-          (kind==='done'?'<span class="tag interval-grey">Done '+shortDateNoYear(occ.doneDate)+'</span>':'')+
+          extraTag+
         '</div>'+
       '</div>'+
-      '<div class="job-actions"><button class="act-btn undo" data-occ-undo="'+occ.key+'" data-job-id="'+job.id+'" title="Undo">↺</button></div>'+
+      actions+
     '</div>';
-  return '<div class="job-flip"><div class="job-swipe-wrap">'+front+'</div></div>';
+  return '<div class="job-flip" data-occ-kind="'+kind+'" data-occ-key="'+occ.key+'" data-job-id="'+job.id+'">'+
+      '<div class="job-swipe-wrap">'+
+        '<div class="swipe-bg right">📅 Change date</div>'+
+        '<div class="swipe-bg left">↺ Undo</div>'+
+        '<div class="flip-inner">'+front+'</div>'+
+      '</div>'+
+    '</div>';
+}
+
+/* Re-pick the date of an already done / postponed occurrence.
+   Done  → moves the recorded done date AND re-bases the next due date.
+   Postp → moves the date the job is postponed to. */
+function editOccurrenceDate(key, kind){
+  const at = key.lastIndexOf('@'); if(at<0) return;
+  const id = Number(key.slice(0,at));
+  const job = RAW.find(j=>j.id===id); if(!job) return;
+  const meta = STATE.jobMeta[key];
+  const current = kind==='done'
+    ? ((meta && meta.doneDate) || key.slice(at+1))
+    : ((STATE.postponedUntil||{})[key] || key.slice(at+1));
+  openDatePickerSheet({
+    title: (kind==='done'?'Change done date — ':'Change postponed date — ')+job.item,
+    initial: current,
+    okLabel: 'Save',
+    note: kind==='done' ? '📅 The next due date is recalculated from this date.' : '',
+    onOk: (iso)=>{
+      if(kind==='done'){
+        STATE.jobMeta[key] = Object.assign({}, meta, { doneDate: iso });
+        STATE.lastDone = STATE.lastDone || {};
+        STATE.lastDone[id] = iso;
+        // re-base the next occurrence off the corrected done date
+        if(isHoursJob(job)){
+          recomputeHoursDue();
+        } else {
+          const months = intervalToMonths(job.interval);
+          if(months) STATE.jobDueOverride[id] = addMonthsISO(iso, months);
+        }
+        // keep any raised permit in step with the corrected date
+        const pid='P'+id;
+        if(STATE.permits[pid]){ STATE.permits[pid].doneDate = iso; STATE.permits[pid].due = iso; }
+      } else {
+        STATE.postponedUntil = STATE.postponedUntil || {};
+        STATE.postponedUntil[key] = iso;
+      }
+      saveState(); toast('Date updated'); refreshAll();
+    }
+  });
+}
+
+/* Undo a done/postponed occurrence back to pending (shared by button + swipe). */
+function undoOccurrence(key, kind){
+  const at = key.lastIndexOf('@'); if(at<0) return;
+  const id = Number(key.slice(0,at));
+  setStatusForKey(key, null);
+  delete STATE.jobMeta[key];
+  if(STATE.postponedUntil) delete STATE.postponedUntil[key];
+  const job = RAW.find(j=>j.id===id);
+  if(job && kind==='done'){
+    delete STATE.jobDueOverride[id];
+    if(STATE.lastDone) delete STATE.lastDone[id];
+    const pid='P'+id; if(STATE.permits[pid]) delete STATE.permits[pid];
+    if(isHoursJob(job)){ delete STATE.hoursJobBase[id]; recomputeHoursDue(); }
+  }
+  saveState(); toast('Status cleared'); updatePermitBell(); renderCurrentView();
+}
+
+/* Swipe on Done/Postponed cards: right → change date, left → undo (confirmed). */
+function attachOccurrenceSwipe(scope){
+  scope.querySelectorAll('.job-flip[data-occ-key]').forEach(flip=>{
+    const wrap = flip.querySelector('.job-swipe-wrap');
+    const inner = flip.querySelector('.flip-inner');
+    const card = flip.querySelector('.job-card');
+    const bgRight = wrap.querySelector('.swipe-bg.right');
+    const bgLeft  = wrap.querySelector('.swipe-bg.left');
+    const key = flip.dataset.occKey, kind = flip.dataset.occKind;
+    let startX=0,startY=0,dx=0,dragging=false,decided=false,isH=false;
+    const T=80;
+    const resetPos=()=>{ inner.style.transition='transform .2s ease'; inner.style.transform=''; bgRight.style.opacity=0; bgLeft.style.opacity=0; };
+
+    card.addEventListener('touchstart', e=>{
+      if(e.target.closest('.act-btn')) return;
+      const t=e.touches[0]; startX=t.clientX; startY=t.clientY; dx=0;
+      dragging=true; decided=false; isH=false; inner.style.transition='none';
+    }, {passive:true});
+    card.addEventListener('touchmove', e=>{
+      if(!dragging) return;
+      const t=e.touches[0]; const diffX=t.clientX-startX, diffY=t.clientY-startY;
+      if(!decided){ if(Math.abs(diffX)>8||Math.abs(diffY)>8){ decided=true; isH=Math.abs(diffX)>Math.abs(diffY); } }
+      if(!isH) return;
+      e.preventDefault(); dx=diffX; inner.style.transform='translateX('+dx+'px)';
+      if(dx>0){ bgRight.style.opacity=Math.min(1,dx/T); bgLeft.style.opacity=0; }
+      else { bgLeft.style.opacity=Math.min(1,-dx/T); bgRight.style.opacity=0; }
+    }, {passive:false});
+    card.addEventListener('touchend', ()=>{
+      if(!dragging) return; dragging=false;
+      const d=dx; resetPos();
+      if(isH && Math.abs(d)>=T){
+        if(d>0) editOccurrenceDate(key, kind);
+        else openConfirmSheet({ title:'Undo this '+(kind==='done'?'completion':'postponement')+'?',
+                                body:'The job goes back to pending.', okLabel:'Undo',
+                                onOk:()=> undoOccurrence(key, kind) });
+      }
+    });
+    card.addEventListener('touchcancel', resetPos);
+  });
 }
 function renderStatusList(kind){
   let occ = statusOccurrences(kind);
   if(kind==='done') occ.sort((a,b)=> b.doneDate.localeCompare(a.doneDate));   // latest done first
-  else occ.sort((a,b)=> a.occDue.localeCompare(b.occDue));
+  else occ.sort((a,b)=> (a.postponedTo||a.occDue).localeCompare(b.postponedTo||b.occDue));
   const view=document.getElementById('view-'+kind);
   const title = kind==='done'? '✅ Completed Jobs' : '⏸️ Postponed Jobs';
   const icon = kind==='done'? '✓' : '⏸';
@@ -1226,17 +1539,19 @@ function renderStatusList(kind){
   view.innerHTML =
     '<div class="section-title">'+title+' — '+occ.length+'</div>'+
     '<div class="job-list" id="'+kind+'JobList">'+(occ.length? occ.map(o=>occurrenceCard(o,kind)).join('') : '<div class="empty-state"><div class="big-icon">'+icon+'</div><div class="msg">'+emptyMsg+'</div></div>')+'</div>';
-  // undo handlers (clear that specific occurrence)
+  // undo handlers (clear that specific occurrence) — confirmed, never a bare tap
   view.querySelectorAll('[data-occ-undo]').forEach(btn=> btn.addEventListener('click', e=>{
     e.stopPropagation();
-    const key=btn.dataset.occUndo; const id=Number(btn.dataset.jobId);
-    setStatusForKey(key, null); delete STATE.jobMeta[key];
-    // if this was the done occurrence that advanced the cycle, roll back the override
-    const job=RAW.find(j=>j.id===id);
-    if(job && kind==='done'){ delete STATE.jobDueOverride[id]; if(STATE.lastDone) delete STATE.lastDone[id];
-      if(isHoursJob(job)){ delete STATE.hoursJobBase[id]; recomputeHoursDue(); } }
-    saveState(); toast('Status cleared'); updatePermitBell(); renderCurrentView();
+    const key=btn.dataset.occUndo;
+    openConfirmSheet({ title:'Undo this '+(kind==='done'?'completion':'postponement')+'?',
+                       body:'The job goes back to pending.', okLabel:'Undo',
+                       onOk:()=> undoOccurrence(key, kind) });
   }));
+  // change the recorded done / postponed-to date
+  view.querySelectorAll('[data-occ-editdate]').forEach(btn=> btn.addEventListener('click', e=>{
+    e.stopPropagation(); editOccurrenceDate(btn.dataset.occEditdate, kind);
+  }));
+  attachOccurrenceSwipe(view);
 }
 
 /* ============================================================
@@ -1272,12 +1587,39 @@ function renderMonthDetail(m){
       (crit?'<span class="cal-crit-badge">'+crit+'</span>':'')+
     '</div>';
   }
+  const months = monthBuckets(); const mi = months.indexOf(m);
+  const prevM = mi>0 ? months[mi-1] : null, nextM = (mi>=0 && mi<months.length-1) ? months[mi+1] : null;
+  const monLabel = (b)=>{ const [yy,mm]=b.split('-').map(Number); return MON[mm-1].slice(0,3)+' '+yy; };
   document.getElementById('view-month').innerHTML =
     '<div class="breadcrumb"><a data-back>← All months</a></div>'+
-    '<div class="section-title">'+label+' — '+jobs.length+' jobs'+(jobs.filter(j=>j.critical).length?' · '+jobs.filter(j=>j.critical).length+' critical':'')+'</div>'+
-    (jobs.length?'<div class="cal-grid">'+DOW.map(d=>'<div class="cal-dow">'+d+'</div>').join('')+cells+'</div>':'<div class="empty-state"><div class="big-icon">⚓</div><div class="msg">No jobs scheduled this month</div></div>');
+    '<div class="day-nav">'+
+      '<button class="arrow-btn" id="monthPrev"'+(prevM?'':' disabled style="opacity:.35;"')+'>‹</button>'+
+      '<div class="day-label"><span class="dl-date">'+label+'</span>'+
+        '<span class="sub">'+jobs.length+' job'+(jobs.length===1?'':'s')+(jobs.filter(j=>j.critical).length?' · '+jobs.filter(j=>j.critical).length+' critical':'')+'</span></div>'+
+      '<button class="arrow-btn" id="monthNext"'+(nextM?'':' disabled style="opacity:.35;"')+'>›</button>'+
+    '</div>'+
+    '<div class="swipe-hint">'+(prevM?'‹ '+monLabel(prevM):'')+' &nbsp;·&nbsp; swipe the calendar &nbsp;·&nbsp; '+(nextM?monLabel(nextM)+' ›':'')+'</div>'+
+    // wrapper is the swipe target: dragging anywhere in the grid's empty space works
+    '<div class="swipe-zone" id="monthSwipe">'+
+      (jobs.length?'<div class="cal-grid">'+DOW.map(d=>'<div class="cal-dow">'+d+'</div>').join('')+cells+'</div>':'<div class="empty-state"><div class="big-icon">⚓</div><div class="msg">No jobs scheduled this month</div></div>')+
+    '</div>';
+  const mp=document.getElementById('monthPrev'); if(mp) mp.addEventListener('click', ()=>navMonth(-1));
+  const mn=document.getElementById('monthNext'); if(mn) mn.addEventListener('click', ()=>navMonth(1));
   document.querySelector('[data-back]').addEventListener('click', ()=> go(()=>{ nav.monthBucket=null; }));
   document.querySelectorAll('.cal-cell.has-jobs[data-date]').forEach(el=>{ const g=()=>openDayModal(el.dataset.date); el.addEventListener('click', g); el.addEventListener('keydown', e=>{ if(e.key==='Enter') g(); }); });
+  // swipe the calendar (its gaps / empty cells) to walk to the next / previous month
+  attachHSwipe(document.getElementById('monthSwipe'), ()=>navMonth(1), ()=>navMonth(-1),
+               { ignoreSelector:'.cal-cell.has-jobs' });
+}
+/* Step to the adjacent month that actually has jobs; wraps at the ends. */
+function navMonth(delta){
+  const months = monthBuckets();
+  if(months.length<2) return;
+  const i = months.indexOf(nav.monthBucket);
+  if(i<0) return;
+  const next = i + delta;
+  if(next<0 || next>=months.length){ toast(delta>0?'No later months':'No earlier months'); return; }
+  go(()=>{ nav.monthBucket = months[next]; });
 }
 /* Month -> day: a real navigation entry so back returns to month-detail */
 function openDayModal(iso){
@@ -1293,12 +1635,25 @@ function showDayModalNow(iso){
   root.innerHTML =
     '<div class="modal-overlay" id="dayOverlay"><div class="modal-sheet" onclick="event.stopPropagation()">'+
       '<div class="modal-head"><h3>'+humanDate(iso)+'</h3><button class="icon-btn" id="dayClose">✕</button></div>'+
+      // the day header inside the sheet is a swipe zone: ← next day, → previous day
+      '<div class="day-nav swipe-zone" id="dayModalNav" style="margin-bottom:8px;">'+
+        '<button class="arrow-btn" id="dayModalPrev">‹</button>'+
+        '<div class="day-label"><span class="dl-date">'+shortDate(iso)+'</span>'+
+          '<span class="sub">'+occs.length+' job'+(occs.length===1?'':'s')+' · swipe to change day</span></div>'+
+        '<button class="arrow-btn" id="dayModalNext">›</button>'+
+      '</div>'+
       (isSaturday(iso)? '<div class="safety-banner" style="margin-bottom:12px;"><span class="sb-ic">🦺</span><span>'+(iso===TODAY?'Today is Safety Day':'Safety Day')+'</span></div>':'')+
       '<div class="job-list" id="dayJobList">'+(occs.length? occs.map(o=>jobCard(o.job,{occDate:o.date, occStatus:o.status})).join('') : '<div class="empty-state"><div class="big-icon">⚓</div><div class="msg">No jobs due on this date.</div></div>')+'</div>'+
     '</div></div>';
   const close=()=>{ history.back(); };   // routed through popstate → pops to month-detail
   document.getElementById('dayOverlay').addEventListener('click', close);
   document.getElementById('dayClose').addEventListener('click', close);
+  // step the modal to another day in place (no extra history entry per day)
+  const step=(delta)=>{ const to=addDays(iso,delta); nav.date=to; nav.__dayModal=to; showDayModalNow(to); };
+  document.getElementById('dayModalPrev').addEventListener('click', ()=>step(-1));
+  document.getElementById('dayModalNext').addEventListener('click', ()=>step(1));
+  attachHSwipe(document.getElementById('dayModalNav'), ()=>step(1), ()=>step(-1),
+               { ignoreSelector:'.arrow-btn' });
   attachJobActions(document.getElementById('dayJobList'));
 }
 
@@ -1332,21 +1687,19 @@ function renderFocus(){
   if(!nav.focusMonth || !months.includes(nav.focusMonth)) nav.focusMonth = months[0];
   const monthJobs = sortJobs(jobs.filter(j=>getJobDue(j).slice(0,7)===nav.focusMonth));
   const permits = activePermits();
-  const permOpen = !!nav.focusPermitsOpen;
   document.getElementById('view-focus').innerHTML =
     '<div class="section-title">⚙️ Motor Starters — '+jobs.length+'</div>'+
+    // collapsed by default — tapping opens the dedicated PTW-06 permits window
     (permits.length?
       '<div class="home-panel" style="margin-bottom:14px; border-color:var(--permit);">'+
-        '<div class="permit-collapse-head'+(permOpen?'':' collapsed')+'" id="focusPermitHead">'+
-          '<h3 style="color:var(--permit);margin:0;">📋 PTW-06 Permits — '+permits.length+' pending</h3>'+
-          '<span class="pch-chev" style="color:var(--permit);font-size:14px;">▾</span>'+
+        '<div class="collapse-head" id="focusPermitHead">'+
+          '<h3 style="color:var(--permit);margin:0;">📋 PTW-06 Permits <span class="collapse-count" style="color:var(--permit);background:var(--permit-soft);">'+permits.length+' pending</span></h3>'+
+          '<span class="ch-chev" style="color:var(--permit);">›</span>'+
         '</div>'+
-        (permOpen? '<div id="focusPermitList" style="margin-top:12px;">'+permits.map(permitRow).join('')+'<button class="btn primary" id="focusPermitExport" style="margin-top:6px;">⬇ Export to Excel (.xls)</button></div>':'')+
       '</div>':'')+
     '<div class="pill-row">'+ (months.length? months.map(m=>{ const cnt=jobs.filter(j=>getJobDue(j).slice(0,7)===m).length; const [y,mo]=m.split('-').map(Number); return '<button class="filter-pill '+(m===nav.focusMonth?'active':'')+'" data-fm="'+m+'">'+MON[mo-1].slice(0,3)+' '+y+' <span class="cnt">'+cnt+'</span></button>'; }).join('') : '') +'</div>'+
     '<div class="job-list" id="focusJobList">'+(monthJobs.length? monthJobs.map(jobCard).join('') : '<div class="empty-state"><div class="big-icon">⚙️</div><div class="msg">No motor-starter routines'+(months.length?' this month':'')+'</div></div>')+'</div>';
-  const ph=document.getElementById('focusPermitHead'); if(ph) ph.addEventListener('click', ()=>{ nav.focusPermitsOpen=!nav.focusPermitsOpen; renderFocus(); });
-  const pe=document.getElementById('focusPermitExport'); if(pe) pe.addEventListener('click', (e)=>{ e.stopPropagation(); exportPermitsXls(); });
+  const ph=document.getElementById('focusPermitHead'); if(ph) ph.addEventListener('click', openPermitModal);
   document.querySelectorAll('#view-focus .filter-pill').forEach(el=> el.addEventListener('click', ()=>{ nav.focusMonth=el.dataset.fm; renderFocus(); }));
   attachJobActions(document.getElementById('focusJobList'));
   attachPermitActions(document.getElementById('view-focus'));
@@ -1606,6 +1959,56 @@ function runSearch(q){
 /* ============================================================
    VIEW: SETTINGS
    ============================================================ */
+/* ---------- Reset-to-sample-data: password gate ---------- */
+const RESET_PASSWORD = '000';
+
+function openResetGate(){
+  const root=document.getElementById('popoverRoot');
+  root.innerHTML =
+    '<div class="sheet-overlay" id="rgOverlay"></div>'+
+    '<div class="complete-sheet" id="rgSheet" style="max-width:400px;">'+
+      '<div class="cs-grip"></div>'+
+      '<div class="cs-title">🔒 Password required</div>'+
+      '<div class="batch-note" style="margin-bottom:12px;">Resetting wipes the imported job list and restores the built-in sample data. Enter the password to continue.</div>'+
+      '<input class="gate-input" id="rgPass" type="password" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="•••">'+
+      '<div class="gate-err" id="rgErr"></div>'+
+      '<div class="cs-actions"><button class="btn" id="rgCancel">Cancel</button><button class="btn primary" id="rgOk">Unlock</button></div>'+
+    '</div>';
+  const close=()=>{ root.innerHTML=''; };
+  document.getElementById('rgOverlay').addEventListener('click', close);
+  document.getElementById('rgCancel').addEventListener('click', close);
+  setTimeout(()=>{ const i=document.getElementById('rgPass'); if(i) i.focus(); }, 60);
+
+  const submit=()=>{
+    const val=(document.getElementById('rgPass').value||'').trim();
+    if(val !== RESET_PASSWORD){
+      // wrong password → say so and drop straight back to the Settings screen
+      close(); toast('Incorrect password');
+      switchTab('settings');
+      return;
+    }
+    close();
+    confirmResetNow();
+  };
+  document.getElementById('rgOk').addEventListener('click', submit);
+  document.getElementById('rgPass').addEventListener('keydown', e=>{ if(e.key==='Enter') submit(); });
+}
+function confirmResetNow(){
+  openConfirmSheet({
+    title:'Reset to sample data?',
+    body:'Your imported jobs will be removed and the built-in sample list restored.',
+    okLabel:'Yes, reset',
+    cancelLabel:'No',
+    onOk:()=>{
+      RAW=JSON.parse(document.getElementById('pms-data').textContent);
+      IMPORT_META={vessel:null,company:null,reportDate:null};
+      try{ localStorage.removeItem(IMPORTED_JOBS_KEY); localStorage.removeItem(META_KEY); }catch(err){}
+      refreshHeader(); recomputeHoursDue(); toast('Reset to sample data');
+      renderNav(); renderCurrentView();
+    }
+  });
+}
+
 function renderSettings(){
   const doneCount=Object.values(STATE.statuses).filter(s=>s==='done').length;
   const postponedCount=Object.values(STATE.statuses).filter(s=>s==='postponed').length;
@@ -1629,7 +2032,7 @@ function renderSettings(){
     '<div class="panel settings-block"><h4>Appearance</h4><p>Switch between dark and light mode. Remembered on this device. Tip: double-tap Spacebar to toggle.</p><button class="btn" id="settingsThemeToggle">Toggle theme</button></div>'+
     '<div class="panel settings-block"><h4>Sync between PC and Mobile</h4><p><b>'+doneCount+'</b> done · <b>'+postponedCount+'</b> postponed · <b>'+activePermits().length+'</b> open permits. Export your progress + permits to carry between devices.</p><button class="btn primary" id="exportBtn">⬇ Export progress (JSON)</button><button class="btn" id="importBtn">⬆ Import progress</button><input type="file" id="importFile" accept="application/json,.json"></div>'+
     '<div class="panel settings-block"><h4>Export as CSV</h4><p>Export the full job list with current status.</p><button class="btn" id="exportCsvBtn">⬇ Export CSV</button></div>'+
-    '<div class="panel settings-block"><h4>About</h4><p style="font-family:var(--font-mono);font-size:11.5px;">Vessel: '+esc(IMPORT_META.vessel||'M.V. Seaways Mirage')+'<br>Company: '+esc(IMPORT_META.company||'Anglo-Eastern Tanker Management')+'<br>Total PMS items: '+RAW.length+'<br><b>This data starts from '+sinceStr+'</b> (PMS export date)<br>App version: <b>v'+APP_VERSION+'</b><br><br>This app is developed by ETO.</p></div>';
+    '<div class="panel settings-block"><h4>About</h4><p style="font-family:var(--font-mono);font-size:11.5px;">Vessel: '+esc(IMPORT_META.vessel||'M.V. Seaways Mirage')+'<br>Company: '+esc(IMPORT_META.company||'Anglo-Eastern Tanker Management')+'<br>Total PMS items: '+RAW.length+'<br><b>This data starts from '+sinceStr+'</b> (PMS export date)<br>App version: <span class="version-pill">v'+APP_VERSION+'</span><br><br>This app is developed by ETO.</p></div>';
 
   document.getElementById('settingsThemeToggle').addEventListener('click', toggleTheme);
   // sound / vibration toggles
@@ -1656,11 +2059,8 @@ function renderSettings(){
     };
     reader.readAsText(file);
   });
-  document.getElementById('resetJobsBtn').addEventListener('click', ()=>{
-    RAW=JSON.parse(document.getElementById('pms-data').textContent); IMPORT_META={vessel:null,company:null,reportDate:null};
-    try{ localStorage.removeItem(IMPORTED_JOBS_KEY); localStorage.removeItem(META_KEY); }catch(err){}
-    refreshHeader(); recomputeHoursDue(); toast('Reset to sample data'); renderNav(); renderCurrentView();
-  });
+  // Reset is destructive → password gate first, then an explicit yes/no confirm.
+  document.getElementById('resetJobsBtn').addEventListener('click', openResetGate);
   document.getElementById('signOffSaveBtn').addEventListener('click', ()=>{ STATE.signOffDate=document.getElementById('signOffInput').value||null; saveState(); toast(STATE.signOffDate?'Sign-off date saved':'Sign-off cleared'); renderSettings(); });
   const cbtn=document.getElementById('signOffClearBtn'); if(cbtn) cbtn.addEventListener('click', ()=>{ STATE.signOffDate=null; saveState(); toast('Sign-off cleared'); renderSettings(); });
   document.getElementById('exportBtn').addEventListener('click', ()=>{ downloadBlob(new Blob([JSON.stringify(STATE,null,2)],{type:'application/json'}),'pms_progress_'+TODAY+'.json'); toast('Progress exported'); });
@@ -1675,6 +2075,7 @@ function renderSettings(){
       }
       if(imp.hoursJobBase) STATE.hoursJobBase=imp.hoursJobBase; if(imp.hoursDueDate) STATE.hoursDueDate=imp.hoursDueDate;
       if(Array.isArray(imp.importantDates)) STATE.importantDates=imp.importantDates; if('soundOn' in imp) STATE.soundOn=imp.soundOn; if('vibrateOn' in imp) STATE.vibrateOn=imp.vibrateOn;
+      if(imp.postponedUntil) STATE.postponedUntil=imp.postponedUntil;
       recomputeHoursDue(); saveState(); toast('Progress imported'); renderNav(); renderCurrentView(); } else toast('Invalid file'); }catch(err){ toast('Could not read file'); } };
     reader.readAsText(file);
   });
@@ -1821,13 +2222,11 @@ function init(){
   document.getElementById('permitBell').addEventListener('click', openPermitModal);
 
   // chip zone: toggle open/closed; auto-collapse when tapping elsewhere or scrolling content
-  const chipToggle = document.getElementById('chipToggle');
-  if(chipToggle) chipToggle.addEventListener('click', (e)=>{ e.stopPropagation(); toggleChips(); });
-  const chipSearch = document.getElementById('chipSearch');
-  if(chipSearch) chipSearch.addEventListener('click', (e)=>{ e.stopPropagation(); switchTab('search'); });
-  document.getElementById('content').addEventListener('click', ()=>{ collapseChips(); unflipCurrent(); }, true);
-  window.addEventListener('scroll', ()=>{ collapseChips(); unflipCurrent(); }, {passive:true});
-  document.getElementById('content').addEventListener('touchmove', ()=>{ collapseChips(); unflipCurrent(); }, {passive:true});
+  const topSearch = document.getElementById('topSearch');
+  if(topSearch) topSearch.addEventListener('click', ()=> switchTab('search'));
+  document.getElementById('content').addEventListener('click', ()=>{ unflipCurrent(); }, true);
+  window.addEventListener('scroll', ()=>{ unflipCurrent(); }, {passive:true});
+  document.getElementById('content').addEventListener('touchmove', ()=>{ unflipCurrent(); }, {passive:true});
 
   renderNav();
   render();

@@ -30,7 +30,7 @@
   --radius:20px; --radius-md:16px; --radius-sm:12px;
   --font-ui:"Inter",-apple-system,"Segoe UI",system-ui,sans-serif;
   --font-mono:"Cascadia Mono","Consolas",monospace;
-  --dock-h:150px;
+  --dock-h:132px;
 }
 [data-theme="light"]{
   --bg-grad-a:#eef2f7; --bg-grad-b:#e6ecf4;
@@ -145,13 +145,19 @@ a{color:inherit;}
   display:flex; align-items:center; justify-content:center; transition:background .15s;
 }
 .arrow-btn:hover{background:var(--accent-soft); color:var(--accent);}
-.day-nav .day-label{flex:1; text-align:center; font-size:16px; font-weight:700; min-width:0;}
-.day-nav .day-label .dl-date{display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.day-nav .day-label{flex:1; text-align:center; font-size:16px; font-weight:700; min-width:0; display:flex; flex-direction:column; align-items:center; gap:2px;}
+.day-nav .day-label .dl-date{display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%;}
 .day-nav .day-label .sub{display:block; font-size:11px; font-weight:500; color:var(--text-faint); margin-top:1px;}
+/* "Today" sits INSIDE the label column (centred, well clear of the ‹ › arrows) */
 .today-btn{
-  padding:7px 13px; border-radius:12px; border:1px solid var(--accent);
-  background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; cursor:pointer;
+  padding:4px 12px; border-radius:11px; border:1px solid var(--accent);
+  background:var(--accent-soft); color:var(--accent); font-size:11px; font-weight:800; cursor:pointer;
+  line-height:1.4; margin-top:2px;
 }
+.today-btn:active{transform:scale(.95);}
+/* swipe affordance on the day header + month calendar */
+.swipe-zone{touch-action:pan-y;}
+.swipe-hint{font-size:10px; color:var(--text-faint); text-align:center; margin:-6px 0 10px; letter-spacing:.3px;}
 .safety-banner{
   display:flex; align-items:center; gap:10px; background:var(--amber-soft); border:1px solid var(--amber);
   color:var(--amber); border-radius:var(--radius-md); padding:11px 14px; margin-bottom:14px; font-weight:700; font-size:13px;
@@ -430,6 +436,25 @@ svg.ring{transform:rotate(-90deg);}
 .impdate-form input[type=text], .impdate-form input[type=date]{width:100%; padding:11px 13px; border-radius:12px; border:1px solid var(--border); background:var(--bg-tile); color:var(--text); font-size:14px; font-family:inherit;}
 .impdate-form input:focus{outline:none; border-color:var(--accent);}
 
+/* --- collapsible section head (Important Dates / PTW-06) --- */
+.collapse-head{display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer; user-select:none;}
+.collapse-head .ch-chev{font-size:13px; color:var(--text-faint); transition:transform .2s ease;}
+.collapse-head.open .ch-chev{transform:rotate(180deg);}
+.collapse-count{font-size:11px; font-weight:800; font-family:var(--font-mono); color:var(--accent); background:var(--accent-soft); border-radius:10px; padding:1px 8px;}
+
+/* --- important date rows: swipe-left/right to delete (no accidental tap) --- */
+.impdate-swipe{position:relative; border-radius:var(--radius-sm); overflow:hidden; margin-bottom:8px;}
+.impdate-swipe .id-swipe-bg{position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; background:var(--red); color:#fff; font-size:12.5px; font-weight:800; padding:0 18px; opacity:0; transition:opacity .1s ease;}
+.impdate-swipe .impdate-item{position:relative; margin-bottom:0; touch-action:pan-y; will-change:transform;}
+
+/* --- password gate --- */
+.gate-input{width:100%; padding:12px 14px; border-radius:12px; border:1px solid var(--border); background:var(--bg-tile); color:var(--text); font-size:20px; font-weight:800; font-family:var(--font-mono); letter-spacing:6px; text-align:center;}
+.gate-input:focus{outline:none; border-color:var(--accent);}
+.gate-err{color:var(--red); font-size:12.5px; font-weight:700; text-align:center; margin-top:8px; min-height:16px;}
+
+/* --- app version pill (settings) --- */
+.version-pill{display:inline-flex; align-items:center; gap:5px; padding:3px 11px; border-radius:20px; background:var(--green-soft); color:var(--green); border:1px solid var(--green); font-family:var(--font-mono); font-size:12px; font-weight:800; letter-spacing:.3px;}
+
 /* ---------- Batch same-day update sheet ---------- */
 .batch-list{display:flex; flex-direction:column; gap:8px; margin:12px 0; max-height:46vh; overflow-y:auto;}
 .batch-item{display:flex; align-items:center; gap:12px; padding:11px 13px; background:var(--bg-tile); border:1px solid var(--border-soft); border-radius:var(--radius-sm); cursor:pointer;}
@@ -461,35 +486,20 @@ input[type=file]{display:none;}
 .bottom-dock{
   position:fixed; left:0; right:0; z-index:80;
   bottom:calc(10px + env(safe-area-inset-bottom, 0px));
-  display:flex; flex-direction:column; align-items:center; gap:9px;
+  display:flex; flex-direction:column; align-items:center; gap:5px;
   pointer-events:none; padding:0 10px;
 }
-/* the chip zone is right-aligned; collapsed = round toggles, expanded = scrollable pills (full width) */
-.chip-zone{ pointer-events:none; display:flex; justify-content:flex-end; align-items:flex-end; gap:8px; width:min(560px,100%); }
-.chip-controls{ pointer-events:none; display:flex; flex-direction:column; gap:8px; flex-shrink:0; }
-/* expanded: hide the round controls so chips get all the space */
-.chip-zone:not(.collapsed) .chip-controls{ display:none; }
-.chip-zone:not(.collapsed) .chip-row{ flex:1; }
-.chip-toggle{
-  pointer-events:auto; flex-shrink:0; width:46px; height:46px; border-radius:50%;
-  background:var(--bg-panel); border:1px solid var(--border); box-shadow:var(--dock-shadow);
-  color:var(--text); font-size:20px; cursor:pointer; display:flex; align-items:center; justify-content:center;
-  transition:background .18s ease, transform .18s ease;
-}
-.chip-toggle:active{transform:scale(.94);}
-.chip-toggle .toggle-badge{position:absolute; margin:-26px 0 0 26px; min-width:16px; height:16px; padding:0 3px; border-radius:8px; background:var(--red); color:#fff; font-size:9px; font-weight:800; font-family:var(--font-mono); display:flex; align-items:center; justify-content:center;}
+/* the chip zone is always expanded: one horizontally scrollable pill row */
+.chip-zone{ pointer-events:none; display:flex; justify-content:center; align-items:flex-end; gap:8px; width:min(560px,100%); }
+.chip-controls{ display:none; }
 .chip-row{
-  pointer-events:auto; display:flex; gap:8px; overflow-x:auto;
-  padding:8px 10px; background:var(--bg-panel); border:1px solid var(--border);
+  pointer-events:auto; display:flex; gap:8px; overflow-x:auto; flex:1;
+  padding:7px 10px; background:var(--bg-panel); border:1px solid var(--border);
   border-radius:22px; box-shadow:var(--dock-shadow);
   scrollbar-width:none; -webkit-overflow-scrolling:touch;
   min-width:0; max-width:100%;
-  transition:opacity .2s ease, transform .2s ease;
 }
 .chip-row::-webkit-scrollbar{display:none;}
-/* collapsed state: hide the pill row, show only the toggle */
-.chip-zone.collapsed .chip-row{ display:none; }
-.chip-zone:not(.collapsed) .chip-toggle{ background:var(--accent); color:#fff; }
 .chip{
   flex-shrink:0; display:flex; align-items:center; gap:6px; padding:9px 15px; border-radius:18px;
   border:1px solid transparent; background:var(--bg-tile); color:var(--text); font-size:12.5px; font-weight:700;
@@ -628,6 +638,7 @@ button:focus-visible, .chip:focus-visible, .nav-item:focus-visible, .month-rect:
       <span class="since" id="sinceLine">Since 10 Jul 2026</span>
     </div>
     <div class="topbar-actions">
+      <button class="icon-btn" id="topSearch" title="Search">🔍</button>
       <button class="icon-btn permit-bell" id="permitBell" title="Permits (PTW-06)">📋<span class="bell-count" id="permitBellCount" style="display:none;">0</span></button>
       <button class="icon-btn" id="themeToggle" title="Toggle dark/light mode">☀️</button>
     </div>
@@ -651,12 +662,8 @@ button:focus-visible, .chip:focus-visible, .nav-item:focus-visible, .month-rect:
   </div>
 
   <div class="bottom-dock">
-    <div class="chip-zone collapsed" id="chipZone">
+    <div class="chip-zone" id="chipZone">
       <nav class="chip-row" id="chipRow"></nav>
-      <div class="chip-controls">
-        <button class="chip-toggle search" id="chipSearch" title="Search">🔍</button>
-        <button class="chip-toggle" id="chipToggle" title="More sections">⋯<span class="toggle-badge" id="chipToggleBadge" style="display:none;">0</span></button>
-      </div>
     </div>
     <nav class="bottom-bar" id="bottomBar"></nav>
   </div>
