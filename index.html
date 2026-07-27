@@ -133,6 +133,13 @@ a{color:inherit;}
 .stat-card.postponed .num{color:var(--red);}
 .stat-card.overdue .num{color:var(--amber);}
 .stat-card.motor .num{color:var(--permit);}
+/* Stat tiles that act as filters (Critical view) */
+.stat-card.tappable{cursor:pointer; position:relative;}
+.stat-card.tappable.picked{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset;}
+.filter-note{
+  font-size:11.5px; font-weight:700; color:var(--accent); background:var(--accent-soft);
+  padding:7px 12px; border-radius:10px; margin-bottom:10px; cursor:pointer; text-align:center;
+}
 
 /* ---------- Day nav ---------- */
 .day-nav{
@@ -507,8 +514,10 @@ input[type=file]{display:none;}
 }
 .chip .c-icon{font-size:14px; line-height:1; display:flex;}
 .chip.active{background:var(--accent); color:#fff;}
-.chip[data-tab="critical"]{background:var(--crit-soft); color:var(--crit);}
-.chip[data-tab="critical"].active{background:var(--crit); color:#111;}
+/* Critical chip: same background as every other chip — only the label is tinted,
+   so an unselected Critical no longer reads as "selected". */
+.chip[data-tab="critical"]{background:var(--bg-tile); color:var(--crit);}
+.chip[data-tab="critical"].active{background:var(--accent); color:#fff;}
 .chip .chip-badge{min-width:17px; height:17px; padding:0 4px; border-radius:9px; background:var(--red); color:#fff; font-size:9.5px; font-weight:800; font-family:var(--font-mono); display:flex; align-items:center; justify-content:center;}
 
 .bottom-bar{

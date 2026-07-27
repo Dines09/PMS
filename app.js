@@ -7,7 +7,7 @@
 "use strict";
 
 /* ---------- App version ---------- */
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 
 /* ---------- Storage keys ---------- */
 const IMPORTED_JOBS_KEY = 'pms_dashboard_imported_jobs_v3';
@@ -398,11 +398,41 @@ const nav = {
   system:null, machine:null,
   focusMonth:null, monthBucket:null,
   critMonth:'all',
+  critFilter:'all',        // 'all' | 'done' | 'overdue' — Critical view stat-tile filter
   searchQuery:'',
   impDatesOpen:false,      // Important Dates panel starts collapsed
   homePermitsOpen:false,   // Home PTW-06 panel starts collapsed
   __dayModal:null
 };
+
+/* ---------- Survive a page refresh on the current screen ----------
+   A reload must NOT dump the user back on Home. We mirror the nav location (and
+   the logical history stack behind it, so back still walks out properly) into
+   sessionStorage on every navigation and restore it at startup. sessionStorage
+   is per-tab and clears when the app is closed, so a genuinely fresh launch
+   still opens on Home. */
+const NAV_SESSION_KEY = 'pms_nav_session_v1';
+function persistNav(){
+  try{
+    sessionStorage.setItem(NAV_SESSION_KEY, JSON.stringify({
+      nav: snapshot(),
+      history: HISTORY,
+      savedAt: Date.now()
+    }));
+  }catch(e){}
+}
+function restoreNav(){
+  try{
+    const s = JSON.parse(sessionStorage.getItem(NAV_SESSION_KEY));
+    if(!s || !s.nav) return false;
+    Object.assign(nav, s.nav);
+    nav.__dayModal = null;               // don't re-open a transient modal after reload
+    HISTORY = Array.isArray(s.history) ? s.history : [];
+    // a stale date (app left open past midnight) shouldn't strand the user in the past
+    if(nav.tab==='daily' && nav.date < TODAY && s.savedAt && (Date.now()-s.savedAt) > 12*3600*1000) nav.date = TODAY;
+    return true;
+  }catch(e){ return false; }
+}
 
 /* ---------- History stack for hardware back button ---------- */
 /* Each entry = a snapshot of nav (deep-ish copy). back() pops to previous. */
@@ -445,6 +475,7 @@ function render(){
   renderCurrentView();
   if(nav.__dayModal){ showDayModalNow(nav.__dayModal); }
   updatePermitBell();
+  persistNav();   // so a refresh lands back on this exact screen
 }
 
 function moveNavSlider(){
@@ -1097,21 +1128,23 @@ function renderHome(){
   const ringR=46, circ=2*Math.PI*ringR, ringOffset=circ-(overallPct/100)*circ;
   const permits = activePermits();
 
-  // Criticals due within the next 7 days — surfaced ABOVE everything else on Home
+  // Criticals due within the next 7 days — surfaced ABOVE everything else on Home.
+  // UPCOMING ONLY: overdue criticals belong in the Critical tab's Overdue view,
+  // not here, so anything dated before today is excluded.
   const crit7 = jobsAll.filter(j=>{
     if(!j.critical || getStatus(j)==='done') return false;
     const d = getJobDue(j); if(!d) return false;
-    return d <= addDays(TODAY,7);              // includes anything already overdue
+    return d >= TODAY && d <= addDays(TODAY,7);
   }).sort((a,b)=> getJobDue(a).localeCompare(getJobDue(b)));
 
   document.getElementById('view-home').innerHTML =
     (crit7.length?
       '<div class="home-panel" style="margin:0 0 14px; border-color:var(--crit); background:var(--crit-soft);">'+
         '<h3 style="color:var(--crit);margin-bottom:10px;">⚠️ Critical — next 7 days ('+crit7.length+')</h3>'+
-        crit7.slice(0,6).map(j=>{ const d=getJobDue(j); const late=d<TODAY;
+        crit7.slice(0,6).map(j=>{ const d=getJobDue(j);
           return '<div class="upcoming-crit-item" data-goto-daily-crit="'+d+'" style="background:var(--bg-panel);">'+
             '<span>'+esc(j.item)+' <span style="color:var(--text-faint);">· '+esc(j.machine)+'</span></span>'+
-            '<span class="uc-date"'+(late?' style="color:var(--red);"':'')+'>'+(late?'OVERDUE · ':'')+shortDateNoYear(d)+'</span></div>';
+            '<span class="uc-date">'+(d===TODAY?'Today · ':'')+shortDateNoYear(d)+'</span></div>';
         }).join('')+
         (crit7.length>6?'<div style="font-size:11.5px;color:var(--crit);font-weight:700;margin-top:6px;cursor:pointer;" id="homeAllCrit">View all '+crit7.length+' criticals →</div>':'')+
       '</div>':'')+
@@ -1665,16 +1698,30 @@ function renderCritical(){
   const months = Array.from(new Set(allCrit.map(j=>getJobDue(j).slice(0,7)))).sort();
   const jobs = nav.critMonth==='all'? allCrit : allCrit.filter(j=>getJobDue(j).slice(0,7)===nav.critMonth);
   const done=jobs.filter(j=>getStatus(j)==='done').length; const overdue=jobs.filter(isOverdue).length; const pct=jobs.length?Math.round(done/jobs.length*100):0;
+  // the stat tiles double as filters: tap Done / Overdue to narrow the list, tap again to clear
+  const f = nav.critFilter||'all';
+  const shown = f==='done'    ? jobs.filter(j=>getStatus(j)==='done')
+              : f==='overdue' ? jobs.filter(isOverdue)
+              : jobs;
+  const filterNote = f==='all' ? '' :
+    '<div class="filter-note" id="critFilterNote">Showing '+(f==='done'?'completed':'overdue')+' only · tap to clear ✕</div>';
   document.getElementById('view-critical').innerHTML =
     '<div class="section-title" style="color:var(--crit);">⚠️ Critical Jobs — '+allCrit.length+'</div>'+
     '<div class="pill-row" id="critMonthBar"><button class="filter-pill crit-variant '+(nav.critMonth==='all'?'active':'')+'" data-cm="all">All Critical</button>'+
       months.map(m=>{ const [y,mo]=m.split('-').map(Number); return '<button class="filter-pill crit-variant '+(nav.critMonth===m?'active':'')+'" data-cm="'+m+'">'+MON[mo-1].slice(0,3)+' '+y+'</button>'; }).join('')+'</div>'+
     '<div class="stat-strip" style="grid-template-columns:repeat(3,1fr); margin-bottom:12px;">'+
-      '<div class="stat-card done"><div class="num">'+done+'</div><div class="label">Done</div></div>'+
-      '<div class="stat-card overdue"><div class="num">'+overdue+'</div><div class="label">Overdue</div></div>'+
-      '<div class="stat-card crit"><div class="num">'+pct+'%</div><div class="label">Progress</div></div></div>'+
-    '<div class="job-list" id="critJobList">'+(jobs.length? jobs.map(jobCard).join('') : '<div class="empty-state"><div class="big-icon">✓</div><div class="msg">No critical jobs here</div></div>')+'</div>';
+      '<div class="stat-card done tappable'+(f==='done'?' picked':'')+'" data-critfilter="done"><div class="num">'+done+'</div><div class="label">Done</div></div>'+
+      '<div class="stat-card overdue tappable'+(f==='overdue'?' picked':'')+'" data-critfilter="overdue"><div class="num">'+overdue+'</div><div class="label">Overdue</div></div>'+
+      '<div class="stat-card crit tappable'+(f==='all'?' picked':'')+'" data-critfilter="all"><div class="num">'+pct+'%</div><div class="label">Progress</div></div></div>'+
+    filterNote+
+    '<div class="job-list" id="critJobList">'+(shown.length? shown.map(jobCard).join('') : '<div class="empty-state"><div class="big-icon">✓</div><div class="msg">No critical jobs here</div></div>')+'</div>';
   document.querySelectorAll('#critMonthBar .filter-pill').forEach(btn=> btn.addEventListener('click', ()=>{ nav.critMonth=btn.dataset.cm; renderCritical(); }));
+  document.querySelectorAll('#view-critical [data-critfilter]').forEach(card=> card.addEventListener('click', ()=>{
+    const want = card.dataset.critfilter;
+    nav.critFilter = (nav.critFilter===want && want!=='all') ? 'all' : want;   // tapping the active tile clears it
+    renderCritical();
+  }));
+  const fn=document.getElementById('critFilterNote'); if(fn) fn.addEventListener('click', ()=>{ nav.critFilter='all'; renderCritical(); });
   attachJobActions(document.getElementById('critJobList'));
 }
 
@@ -1890,33 +1937,65 @@ function renderSearch(){
   const q = nav.searchQuery||'';
   document.getElementById('view-search').innerHTML =
     '<div class="section-title">🔍 Search</div>'+
-    '<input type="text" class="search-box" id="uniSearch" placeholder="Search item, machine, system, date (e.g. 17 Jul or 2026-07-17)..." value="'+esc(q)+'">'+
+    '<input type="text" class="search-box" id="uniSearch" placeholder="Search item, machine, work… or a date like &quot;Jul&quot;, &quot;17 Jul&quot;, 2026-07-17" value="'+esc(q)+'">'+
     '<div id="searchResults"></div>';
   const input = document.getElementById('uniSearch');
   input.addEventListener('input', ()=>{ nav.searchQuery=input.value; runSearch(input.value); });
   input.focus();
   runSearch(q);
 }
-/* Try to read a date fragment from a token/query. Returns {day,mon,year} partial or null.
-   Understands: 2026-08-06, 6-8, 6/8, "6 aug", "6aug", "aug 6", "6 august 2026". */
+/* ---------- Date-aware query parsing ----------
+   The old parser searched the query for a month name ANYWHERE inside a word, so
+   "deck" hit "december" (dec…) and every December job came back. That is wrong.
+
+   Rules now:
+   • A month is only recognised from a WHOLE token that is EXACTLY the 3-letter
+     abbreviation (jul, dec, …) or the full month name (july, december).
+     "deck", "decking", "julia" are ordinary text — never a month.
+   • A date query is only a date query if the WHOLE query is nothing but date
+     parts (month token / day number / year / ISO / d-m-y). Anything else — even
+     "jul pump" — falls through to text search, where the month token still
+     matches the due date.                                                     */
 const MON_ABBR = MON.map(m=>m.slice(0,3).toLowerCase());
+const MON_FULL = MON.map(m=>m.toLowerCase());
+/* month index (1-12) for an exact token, else 0 */
+function monthFromToken(tok){
+  tok = String(tok||'').toLowerCase();
+  let i = MON_ABBR.indexOf(tok);            // exactly "jul"
+  if(i>=0) return i+1;
+  i = MON_FULL.indexOf(tok);                // exactly "july"
+  if(i>=0) return i+1;
+  return 0;
+}
 function parseDateQuery(q){
-  q = q.toLowerCase().trim();
+  q = String(q||'').toLowerCase().trim();
+  if(!q) return null;
+
   // ISO or partial ISO: 2026-08-06 / 2026-08 / 2026
   let m = q.match(/^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?$/);
   if(m) return { year:+m[1], mon:m[2]?+m[2]:null, day:m[3]?+m[3]:null };
-  // day + month-name (either order): "6 aug", "aug 6", "6 august 2026"
-  const monName = MON_ABBR.find(a=> new RegExp('\\b'+a).test(q));
-  if(monName){
-    const monIdx = MON_ABBR.indexOf(monName)+1;
-    const dm = q.match(/\b(\d{1,2})\b/);
-    const ym = q.match(/\b(\d{4})\b/);
-    return { year:ym?+ym[1]:null, mon:monIdx, day:(dm && (!ym || dm[1]!==ym[1]))?+dm[1]:null };
-  }
-  // numeric d-m or d/m (day first)
+
+  // numeric d-m or d/m (day first): 6-8, 6/8/26
   m = q.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
   if(m){ let y=m[3]?+m[3]:null; if(y&&y<100) y+=2000; return { day:+m[1], mon:+m[2], year:y }; }
-  return null;
+
+  // Token form: every token must be a month name, a day number, or a year.
+  // "jul", "jul 2026", "6 aug", "august 6 2026", "17 jul 26" → date.
+  // "jul pump", "deck" → not a date (falls through to text search).
+  const toks = q.split(/[\s,]+/).filter(Boolean);
+  if(!toks.length || toks.length>3) return null;
+  let mon=null, day=null, year=null;
+  for(const t of toks){
+    const mi = monthFromToken(t);
+    if(mi){ if(mon!=null) return null; mon=mi; continue; }
+    if(/^\d{4}$/.test(t)){ if(year!=null) return null; year=+t; continue; }
+    if(/^\d{1,2}$/.test(t)){ if(day!=null) return null; day=+t; continue; }
+    if(/^\d{2}$/.test(t)){ if(year!=null) return null; year=2000+ +t; continue; }
+    return null;                       // a non-date token → this is a text search
+  }
+  // A bare day number ("17") on its own is too vague to be a date query.
+  if(mon==null && year==null) return null;
+  return { year, mon, day };
 }
 function runSearch(q){
   const box = document.getElementById('searchResults');
@@ -1943,12 +2022,17 @@ function runSearch(q){
     attachJobActions(document.getElementById('searchJobList'));
     return;
   }
-  // multi-word text search over live occurrences
+  // ---- multi-word text search over live occurrences ----
+  // Words may appear in any order and match anywhere in the job's text. The due
+  // date is searched separately and only on WHOLE tokens, so a text word like
+  // "deck" can never match the month "December" through the date field.
   const words = raw.toLowerCase().split(/\s+/).filter(Boolean);
   let results = visibleJobs().filter(j=>{
     const due = getJobDue(j);
-    const hay = (j.item+' '+j.machine+' '+j.system+' '+j.group_full+' '+j.work+' '+j.dept+' '+intervalLabel(j.interval)+' '+due+' '+shortDate(due)+' '+shortDateNoYear(due)).toLowerCase();
-    return words.every(w=> hay.includes(w));
+    const text = (j.item+' '+j.machine+' '+j.system+' '+j.group_full+' '+j.work+' '+j.dept+' '+intervalLabel(j.interval)).toLowerCase();
+    const dateToks = (due ? (due+' '+shortDate(due)+' '+shortDateNoYear(due)) : '')
+                       .toLowerCase().split(/[\s\-]+/).filter(Boolean);
+    return words.every(w=> text.includes(w) || dateToks.includes(w));
   });
   results = sortJobs(results);
   if(!results.length){ box.innerHTML = '<div class="empty-state"><div class="big-icon">🚫</div><div class="msg">No matches for "'+esc(raw)+'"</div></div>'; return; }
@@ -2227,6 +2311,9 @@ function init(){
   document.getElementById('content').addEventListener('click', ()=>{ unflipCurrent(); }, true);
   window.addEventListener('scroll', ()=>{ unflipCurrent(); }, {passive:true});
   document.getElementById('content').addEventListener('touchmove', ()=>{ unflipCurrent(); }, {passive:true});
+
+  // restore the screen the user was on before a refresh (before the first render)
+  restoreNav();
 
   renderNav();
   render();
