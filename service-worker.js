@@ -1,5 +1,5 @@
 /* PMS Dashboard service worker — offline cache */
-const CACHE = 'pms-dashboard-v8';
+const CACHE = 'pms-dashboard-v9';
 const ASSETS = [
   './',
   './index.html',

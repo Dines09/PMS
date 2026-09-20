@@ -7,7 +7,7 @@
 "use strict";
 
 /* ---------- App version ---------- */
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.4.1';
 
 /* ---------- Storage keys ---------- */
 const IMPORTED_JOBS_KEY = 'pms_dashboard_imported_jobs_v3';
@@ -292,9 +292,15 @@ function setStatusForKey(key, status){ if(status===null) delete STATE.statuses[k
 function setStatus(job, status){ setStatusForKey(statusKey(job), status); }
 function isOverdue(job){ const d=getJobDue(job); return d && d < TODAY && getStatus(job)!=='done'; }
 function withinSignOff(job){ if(!STATE.signOffDate) return true; return getJobDue(job) <= STATE.signOffDate; }
-/* A running-hours job with no due date yet ('') is not scheduled anywhere on the
-   calendar — exclude it from the general job pool (still reachable in Machines). */
-function isScheduled(job){ return !(isHoursJob(job) && !getJobDue(job)); }
+/* A job with no due date is not scheduled anywhere on the calendar — exclude it
+   from the general job pool (still reachable in Machines / search).
+   Two cases produce a blank due date:
+     - a running-hours job that has not reached its trigger yet, and
+     - a calendar job the PMS export ships with an empty "Due" column (a
+       never-done long-interval item, e.g. a 120 M renewal).
+   Both must be filtered out: '' has no year-month, so letting one through
+   creates an empty month bucket that breaks the Monthly view. */
+function isScheduled(job){ return !!getJobDue(job); }
 function visibleJobs(){ return RAW.filter(j=> isScheduled(j) && withinSignOff(j)); }
 
 /* Occurrences a job appears on:
@@ -1590,8 +1596,11 @@ function renderStatusList(kind){
 /* ============================================================
    VIEW: MONTHLY
    ============================================================ */
-function monthBuckets(){ return Array.from(new Set(visibleJobs().map(j=>getJobDue(j).slice(0,7)))).sort(); }
-function allDataMonths(){ return Array.from(new Set(RAW.map(j=>getJobDue(j).slice(0,7)))).sort(); }
+/* Month keys are 'YYYY-MM'. Anything else (a job with a blank or unparseable
+   due date) is dropped here so a single bad CSV row can never blank the view. */
+function isMonthKey(m){ return /^\d{4}-\d{2}$/.test(m); }
+function monthBuckets(){ return Array.from(new Set(visibleJobs().map(j=>getJobDue(j).slice(0,7)))).filter(isMonthKey).sort(); }
+function allDataMonths(){ return Array.from(new Set(RAW.map(j=>getJobDue(j).slice(0,7)))).filter(isMonthKey).sort(); }
 function renderMonth(){
   if(nav.monthBucket){ renderMonthDetail(nav.monthBucket); return; }
   const months=monthBuckets(); const hidden = STATE.signOffDate && allDataMonths().length>months.length;
@@ -1695,7 +1704,7 @@ function showDayModalNow(iso){
    ============================================================ */
 function renderCritical(){
   const allCrit = sortJobs(visibleJobs().filter(j=>j.critical));
-  const months = Array.from(new Set(allCrit.map(j=>getJobDue(j).slice(0,7)))).sort();
+  const months = Array.from(new Set(allCrit.map(j=>getJobDue(j).slice(0,7)))).filter(isMonthKey).sort();
   const jobs = nav.critMonth==='all'? allCrit : allCrit.filter(j=>getJobDue(j).slice(0,7)===nav.critMonth);
   const done=jobs.filter(j=>getStatus(j)==='done').length; const overdue=jobs.filter(isOverdue).length; const pct=jobs.length?Math.round(done/jobs.length*100):0;
   // the stat tiles double as filters: tap Done / Overdue to narrow the list, tap again to clear
@@ -1730,7 +1739,7 @@ function renderCritical(){
    ============================================================ */
 function renderFocus(){
   const jobs = visibleJobs().filter(isFocusJob);
-  const months = Array.from(new Set(jobs.map(j=>getJobDue(j).slice(0,7)))).sort();
+  const months = Array.from(new Set(jobs.map(j=>getJobDue(j).slice(0,7)))).filter(isMonthKey).sort();
   if(!nav.focusMonth || !months.includes(nav.focusMonth)) nav.focusMonth = months[0];
   const monthJobs = sortJobs(jobs.filter(j=>getJobDue(j).slice(0,7)===nav.focusMonth));
   const permits = activePermits();
