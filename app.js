@@ -7,7 +7,7 @@
 "use strict";
 
 /* ---------- App version ---------- */
-const APP_VERSION = '1.4.1';
+const APP_VERSION = '1.4.2';
 
 /* ---------- Storage keys ---------- */
 const IMPORTED_JOBS_KEY = 'pms_dashboard_imported_jobs_v3';
@@ -2334,8 +2334,15 @@ function init(){
 
   // Register service worker for offline / installable PWA (only over http/https)
   if('serviceWorker' in navigator && location.protocol.startsWith('http')){
-    window.addEventListener('load', ()=>{ navigator.serviceWorker.register('service-worker.js').catch(()=>{}); });
+    const registerSW = ()=>{
+      navigator.serviceWorker.register('service-worker.js').catch(()=>{});
+      // Refill the offline cache if anything was cleared from it (no-op offline).
+      navigator.serviceWorker.ready.then(reg=>{ if(navigator.onLine && reg.active) reg.active.postMessage('heal'); }).catch(()=>{});
+    };
+    if(document.readyState === 'complete') registerSW(); else window.addEventListener('load', registerSW);
   }
+  // Ask the browser not to evict this app's data/cache under storage pressure.
+  if(navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(()=>{});
 }
 
 init();
